@@ -13,3 +13,4 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 fontdue = "0.9"
 fontdb = "0.23"
 log = "0.4"
+base64 = "0.22"

@@ -90,7 +90,11 @@ impl TlSession {
             }
             "tl.json" => {
                 let t = self.timeline.as_ref().context("no timeline")?;
-                serde_json::to_value(t).map_err(Into::into)
+                // duration is computed, not stored — the playhead/UI needs it
+                let mut j = serde_json::to_value(t)?;
+                j.as_object_mut()
+                    .map(|o| o.insert("duration".into(), json!(t.duration())));
+                Ok(j)
             }
             "tl.addTrack" => {
                 let kind_s = req_str(v, "kind")?;
@@ -185,11 +189,27 @@ impl TlSession {
             }
             "tl.renderFrame" => {
                 let t_sec = req_f64(v, "t")?;
-                let out = req_str(v, "out")?;
                 let tl = self.timeline.as_ref().context("no timeline")?;
                 let img = render::render_frame(tl, t_sec)?;
-                img.save(&out).with_context(|| format!("save {out}"))?;
-                Ok(json!({"path": out, "w": img.width(), "h": img.height(), "t": t_sec}))
+                match v.get("out").and_then(Value::as_str) {
+                    // `out` path → write file and report it
+                    Some(out) => {
+                        img.save(out).with_context(|| format!("save {out}"))?;
+                        Ok(json!({"path": out, "w": img.width(), "h": img.height(), "t": t_sec}))
+                    }
+                    // no path → inline PNG like doc.render's pngB64
+                    None => {
+                        use base64::Engine as _;
+                        let mut buf = std::io::Cursor::new(Vec::new());
+                        img.write_to(&mut buf, image::ImageFormat::Png)
+                            .context("encode png")?;
+                        Ok(json!({
+                            "pngB64": base64::engine::general_purpose::STANDARD
+                                .encode(buf.into_inner()),
+                            "w": img.width(), "h": img.height(), "t": t_sec,
+                        }))
+                    }
+                }
             }
             "tl.render" => {
                 let out = req_str(v, "out")?;

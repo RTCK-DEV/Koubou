@@ -10,9 +10,28 @@ use anyhow::{Context, Result};
 use image::RgbaImage;
 use serde_json::Value;
 
-/// is `ffmpeg` on PATH?
+/// GUI apps on macOS get a sparse PATH (`/usr/bin:/bin:…`) — brew-installed
+/// tools like ffmpeg live at /opt/homebrew/bin. Resolve: KOUBOU_<NAME> env
+/// override → well-known absolute paths → bare name (PATH lookup).
+pub fn tool_path(name: &str) -> String {
+    let env_key = format!("KOUBOU_{}", name.to_uppercase());
+    if let Ok(p) = std::env::var(&env_key) {
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"] {
+        let p = format!("{dir}/{name}");
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+    }
+    name.to_string()
+}
+
+/// is `ffmpeg` available (GUI-safe)?
 pub fn have_ffmpeg() -> bool {
-    Command::new("ffmpeg")
+    Command::new(tool_path("ffmpeg"))
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -21,9 +40,9 @@ pub fn have_ffmpeg() -> bool {
         .unwrap_or(false)
 }
 
-/// is `ffprobe` on PATH?
+/// is `ffprobe` available (GUI-safe)?
 pub fn have_ffprobe() -> bool {
-    Command::new("ffprobe")
+    Command::new(tool_path("ffprobe"))
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -71,11 +90,11 @@ fn run(prog: &str, args: &[String], stdin: Option<&[u8]>) -> Result<Output> {
 }
 
 pub fn run_ffmpeg(args: &[String]) -> Result<Output> {
-    run("ffmpeg", args, None)
+    run(&tool_path("ffmpeg"), args, None)
 }
 
 pub fn run_ffprobe(args: &[String]) -> Result<Output> {
-    run("ffprobe", args, None)
+    run(&tool_path("ffprobe"), args, None)
 }
 
 fn s(v: &impl std::fmt::Display) -> String {
@@ -296,7 +315,7 @@ pub fn curl(url: &str, args: &[String], timeout_secs: u64) -> Result<Vec<u8>> {
     let mut all = vec!["-sS".into(), "-m".into(), s(&timeout_secs)];
     all.extend_from_slice(args);
     all.push(url.into());
-    let out = run("curl", &all, None).with_context(|| format!("curl {url} failed"))?;
+    let out = run(&tool_path("curl"), &all, None).with_context(|| format!("curl {url} failed"))?;
     Ok(out.stdout)
 }
 

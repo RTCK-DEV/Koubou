@@ -68,7 +68,9 @@ final class MotionStore: ObservableObject {
                     switch then {
                     case .none: break
                     case .reload: self.reloadState()
-                    case .preview: self.renderFrame()
+                    // preview = state refresh + frame render (reloadState
+                    // already tails into renderFrame via applyState)
+                    case .preview: self.reloadState()
                     }
                 } else {
                     self.error = r["error"] as? String ?? "command failed"
@@ -276,8 +278,7 @@ final class MotionStore: ObservableObject {
 }
 
 struct MotionView: View {
-    @EnvironmentObject var store: LibraryStore
-    private var m: MotionStore { store.motion }
+    @ObservedObject var m: MotionStore
     @State private var genPrompt = ""
     @State private var genEndpoint = "http://127.0.0.1:8000"
     @State private var showGen = false

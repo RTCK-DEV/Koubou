@@ -71,6 +71,8 @@ final class PagesStore: ObservableObject {
         opened = true
         dispatch(["id": "pg.new", "name": name, "w": pageW,
                   "h": pageH, "margins": margins])
+        // a fresh doc has zero pages — add one so the canvas isn't empty
+        dispatch(["id": "pg.addPage"])
     }
 
     func open(_ url: URL) {
@@ -190,8 +192,7 @@ final class PagesStore: ObservableObject {
 }
 
 struct PagesView: View {
-    @EnvironmentObject var store: LibraryStore
-    private var p: PagesStore { store.pages }
+    @ObservedObject var p: PagesStore
     @State private var paperSize = "A4"
 
     var body: some View {
@@ -255,6 +256,7 @@ struct PagesView: View {
                                 .stroke(p.selectedFrame == f.id ? Kou.accent : Color.blue.opacity(0.45),
                                         lineWidth: p.selectedFrame == f.id ? 2 : 1)
                                 .frame(width: f.w * scale, height: f.h * scale)
+                                .contentShape(Rectangle())
                                 .offset(x: f.x * scale, y: f.y * scale)
                                 .onTapGesture { p.selectedFrame = f.id }
                         }

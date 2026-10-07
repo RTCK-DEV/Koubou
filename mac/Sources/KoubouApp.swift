@@ -75,8 +75,8 @@ struct StudioView: View {
         switch store.mode {
         case .library: LibraryView()
         case .doc: DocEditorView(doc: store.doc) { store.mode = .library }
-        case .motion: MotionView()
-        case .pages: PagesView()
+        case .motion: MotionView(m: store.motion)
+        case .pages: PagesView(p: store.pages)
         }
     }
 }
