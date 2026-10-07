@@ -200,4 +200,11 @@ final class DocSession: @unchecked Sendable {
             queue.async { c.resume(returning: f(self)) }
         }
     }
+
+    /// Synchronous session call on the serial queue — for cheap commands
+    /// (hit tests) that must answer inside a gesture. Never call from
+    /// `queue` itself (deadlock).
+    func workSync<T>(_ f: (DocSession) -> T) -> T {
+        queue.sync { f(self) }
+    }
 }

@@ -23,6 +23,9 @@ final class CanvasOverlayNSView: NSView {
     private static let accent =
         NSColor(srgbRed: 1.0, green: 0.62, blue: 0.13, alpha: 1)
 
+    /// match SwiftUI's top-left origin — callers pass view-space rects
+    override var isFlipped: Bool { true }
+
     override func hitTest(_ p: NSPoint) -> NSView? { nil }
 
     private func makeWindow(fill: NSColor?, border: NSColor?) -> NSWindow {
@@ -259,6 +262,16 @@ final class DocStore: ObservableObject {
             await MainActor.run { hit(lid?.uint64Value) }
             _ = self
         }
+    }
+
+    /// synchronous pick for gestures — the hit test is microseconds; an
+    /// async round-trip loses any drag released before the answer lands
+    func pickSync(at pt: CGPoint) -> UInt64? {
+        guard let s = ensure() else { return nil }
+        let r = s.workSync { sess in
+            sess.dispatch(["id": "doc.pick", "x": Double(pt.x), "y": Double(pt.y)])
+        }
+        return ((r["result"] as? [String: Any])?["layer"] as? NSNumber)?.uint64Value
     }
 
     /// client-side bounds hit test — instant, used for hover/outline only;
@@ -770,13 +783,16 @@ struct DocEditorView: View {
     /// what an in-progress drag is doing
     private enum DragMode {
         case none
-        case picking                    // waiting for doc.pick to answer
         case moving(UInt64, CGPoint, CGPoint)   // layer, doc-space start, orig x/y
         case marquee(CGPoint, CGPoint)          // start, current (view space)
         case scaling(UInt64, CGPoint, Double, Double) // layer, bbox center, start dist, orig scale
     }
     @State private var dragMode: DragMode = .none
     @State private var pickStarted = false
+    /// last tap on a text layer — a second tap within 0.45s opens the
+    /// on-canvas editor (drag-based: a zero-distance DragGesture always
+    /// wins over TapGesture(count:2), so clicks are detected here)
+    @State private var lastTap: (time: Date, id: UInt64)? = nil
     /// live gesture visuals — @GestureState updates mid-gesture,
     /// unlike @State/@Published which defer until the gesture ends
     /// live gesture span — drives all in-flight canvas visuals
@@ -835,7 +851,6 @@ struct DocEditorView: View {
             .background(Kou.bg0)
             .contentShape(Rectangle())
             .gesture(canvasDrag(in: geo.size))
-            .onTapGesture(count: 2) { p in doubleTap(at: p, in: geo.size) }
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let p): doc.hoverPt = p
@@ -928,23 +943,19 @@ struct DocEditorView: View {
                             }
                         }
                     }
-                    // else pick once, then decide move vs marquee
+                    // else pick once (synchronous — the hit test is
+                    // microseconds; async loses fast drags), then decide
+                    // move vs marquee
                     if !pickStarted {
                         pickStarted = true
-                        dragMode = .picking
-                        doc.pick(at: startDpt) { lid in
-                            // user may have released before the answer arrived
-                            guard pickStarted else { return }
-                            if let lid {
-                                if let l = DocStore.find(lid, in: doc.layers) {
-                                    dragMode = .moving(lid, startDpt,
-                                                       CGPoint(x: l.x, y: l.y))
-                                    doc.selected = lid
-                                    doc.selectedSet = [lid]
-                                    return
-                                }
-                            }
-                            dragMode = .marquee(g.startLocation, g.startLocation)
+                        if let lid = doc.pickSync(at: startDpt),
+                           let l = DocStore.find(lid, in: doc.layers) {
+                            dragMode = .moving(lid, startDpt,
+                                               CGPoint(x: l.x, y: l.y))
+                            doc.selected = lid
+                            doc.selectedSet = [lid]
+                        } else {
+                            dragMode = .marquee(g.startLocation, g.location)
                         }
                         return
                     }
@@ -981,8 +992,6 @@ struct DocEditorView: View {
                                                  outline: viewRect(ob, in: size))
                         }
                     }
-                case .picking:
-                    break
                 }
             }
             .onEnded { g in
@@ -990,6 +999,29 @@ struct DocEditorView: View {
                     dragMode = .none
                     pickStarted = false
                     doc.overlay?.setDraw(band: nil, outline: nil)
+                }
+                // tap detection: a gesture that barely moved is a click —
+                // two quick clicks on the same text layer open the editor;
+                // a tap anywhere else commits an open editor
+                let tapLike = g.translation.width * g.translation.width
+                    + g.translation.height * g.translation.height < 16
+                var opened: UInt64? = nil
+                if tapLike, case .moving(let id, _, _) = dragMode,
+                   let l = DocStore.find(id, in: doc.layers), l.kind == "text" {
+                    let now = Date()
+                    if let last = lastTap, last.id == id,
+                       now.timeIntervalSince(last.time) < 0.45 {
+                        doc.textEdit = (id, (l.text?["text"] as? String) ?? "")
+                        opened = id
+                        lastTap = nil
+                    } else {
+                        lastTap = (now, id)
+                    }
+                } else if tapLike {
+                    lastTap = nil
+                }
+                if doc.textEdit != nil, doc.textEdit?.id != opened {
+                    commitTextEdit()
                 }
                 switch dragMode {
                 case .moving(let id, _, _), .scaling(let id, _, _, _):
@@ -1021,20 +1053,6 @@ struct DocEditorView: View {
             }
     }
 
-    /// double-click: pick → text layer opens the on-canvas editor
-    private func doubleTap(at p: CGPoint, in size: CGSize) {
-        let dpt = docPoint(p, in: size)
-        doc.pick(at: dpt) { lid in
-            guard let lid, let l = DocStore.find(lid, in: doc.layers),
-                  l.kind == "text" else {
-                if doc.textEdit != nil { commitTextEdit() }
-                return
-            }
-            doc.selected = lid
-            doc.textEdit = (lid, (l.text?["text"] as? String) ?? "")
-        }
-    }
-
     private func commitTextEdit() {
         if let ed = doc.textEdit {
             var t = DocStore.find(ed.id, in: doc.layers)?.text ?? [:]
@@ -1058,8 +1076,8 @@ struct DocEditorView: View {
     /// view point → document pixel coords
     private func docPoint(_ p: CGPoint, in size: CGSize) -> CGPoint {
         let rect = imageRect(in: size)
-        guard let img = doc.composite, rect.width > 0, doc.docW > 0 else { return .zero }
-        let sx = Double(doc.docW) / Double(img.width)
+        guard doc.composite != nil, rect.width > 0, doc.docW > 0 else { return .zero }
+        let sx = Double(doc.docW) / Double(rect.width)
         return CGPoint(x: Double(p.x - rect.minX) * sx,
                        y: Double(p.y - rect.minY) * sx)
     }
@@ -1716,6 +1734,7 @@ struct RecipeInspector: View {
                     .background(pal == p ? Kou.accentSoft : Color.clear)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                     .foregroundStyle(pal == p ? Kou.accent : Kou.text3)
+                    .contentShape(Rectangle())
                     .onTapGesture { pal = p }
                 }
             }
