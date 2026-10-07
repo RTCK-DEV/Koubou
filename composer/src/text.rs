@@ -1,6 +1,10 @@
 //! Text rasterization: fontdb for font discovery, fontdue for glyph coverage.
 //! Produces a tight-bbox rgba8 bitmap (premultiplied color) + the offset where
 //! the bitmap sits relative to the text origin (x = left edge, y = baseline).
+//!
+//! Per-character font fallback: glyphs the chosen font doesn't cover (CJK,
+//! symbols) are routed to the first installed font that has them — Hiragino /
+//! Yu / Noto families on macOS — so Japanese text never renders as tofu.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,6 +17,20 @@ use crate::doc::{TextAlign, TextContent};
 static FONT_DB: Mutex<Option<fontdb::Database>> = Mutex::new(None);
 static FONTS: std::sync::LazyLock<Mutex<HashMap<String, fontdue::Font>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// families tried, in order, for characters the requested font can't draw
+const FALLBACK_FAMILIES: &[&str] = &[
+    "Hiragino Sans",
+    "Hiragino Kaku Gothic ProN",
+    "Yu Gothic",
+    "YuGothic",
+    "Hiragino Mincho ProN",
+    "Noto Sans CJK JP",
+    "Noto Sans JP",
+    "Apple SD Gothic Neo",
+    "PingFang SC",
+    "Arial Unicode MS",
+];
 
 fn db() -> std::sync::MutexGuard<'static, Option<fontdb::Database>> {
     let mut g = FONT_DB.lock().unwrap_or_else(|e| e.into_inner());
@@ -39,7 +57,9 @@ fn load_font(spec: &str, bold: bool, italic: bool) -> Result<fontdue::Font> {
             .map_err(|e| anyhow::anyhow!("load font {}: {e}", p.display()))?
     } else {
         let guard = db();
-        let d = guard.as_ref().unwrap();
+        let Some(d) = guard.as_ref() else {
+            anyhow::bail!("font database unavailable");
+        };
         let weight = if bold {
             fontdb::Weight::BOLD
         } else {
@@ -101,6 +121,55 @@ fn load_font(spec: &str, bold: bool, italic: bool) -> Result<fontdue::Font> {
     Ok(font)
 }
 
+/// ordered font list for a text run: requested font first, then fallback
+/// families that actually resolve to a DIFFERENT face (missing families map
+/// to the default font — deduped by name so the per-char search stays short)
+struct FontChain {
+    fonts: Vec<fontdue::Font>,
+    /// char -> index into fonts, memoised per rasterize call
+    cmap: HashMap<char, usize>,
+}
+
+impl FontChain {
+    fn load(spec: &str, bold: bool, italic: bool) -> Result<FontChain> {
+        let mut fonts = vec![load_font(spec, bold, italic)?];
+        let mut seen: std::collections::HashSet<String> = fonts
+            .iter()
+            .map(|f| f.name().unwrap_or("").to_string())
+            .collect();
+        for fam in FALLBACK_FAMILIES {
+            if let Ok(f) = load_font(fam, bold, italic) {
+                if seen.insert(f.name().unwrap_or("").to_string()) {
+                    fonts.push(f);
+                }
+            }
+        }
+        Ok(FontChain {
+            fonts,
+            cmap: HashMap::new(),
+        })
+    }
+
+    /// index of the first font that covers `ch`
+    fn slot(&mut self, ch: char) -> usize {
+        if let Some(&i) = self.cmap.get(&ch) {
+            return i;
+        }
+        let i = self
+            .fonts
+            .iter()
+            .position(|f| f.lookup_glyph_index(ch) != 0 || ch == ' ' || ch == '\t')
+            .unwrap_or(0);
+        self.cmap.insert(ch, i);
+        i
+    }
+
+    fn metrics(&mut self, ch: char, px: f32) -> fontdue::Metrics {
+        let i = self.slot(ch);
+        self.fonts[i].metrics(ch, px)
+    }
+}
+
 struct Glyph {
     bitmap: Vec<u8>,
     w: usize,
@@ -110,11 +179,13 @@ struct Glyph {
     advance: f32,
 }
 
-fn raster_line(font: &fontdue::Font, s: &str, px: f32, tracking: f32) -> (Vec<Glyph>, f32, f32) {
+fn raster_line(chain: &mut FontChain, s: &str, px: f32, tracking: f32) -> (Vec<Glyph>, f32, f32) {
     let mut out = Vec::new();
     let mut pen = 0.0f32;
     let mut max_above = 0.0f32;
     for ch in s.chars() {
+        let fi = chain.slot(ch);
+        let font = &chain.fonts[fi];
         let (m, bmp) = font.rasterize(ch, px);
         if ch != ' ' && ch != '\t' {
             max_above = max_above.max(m.ymin as f32 + m.height as f32);
@@ -139,9 +210,9 @@ pub fn rasterize(tc: &TextContent) -> Result<(Vec<u8>, u32, u32)> {
     if tc.text.is_empty() {
         return Ok((Vec::new(), 0, 0));
     }
-    let font = load_font(&tc.font, tc.bold, tc.italic)?;
+    let mut chain = FontChain::load(&tc.font, tc.bold, tc.italic)?;
     let px = tc.size.max(1.0);
-    let metrics = font.horizontal_line_metrics(px);
+    let metrics = chain.fonts[0].horizontal_line_metrics(px);
     let (ascent, descent, gap) = metrics
         .map(|m| (m.ascent, m.descent, m.line_gap))
         .unwrap_or((px, -px * 0.25, 0.0));
@@ -149,11 +220,31 @@ pub fn rasterize(tc: &TextContent) -> Result<(Vec<u8>, u32, u32)> {
     let asc_i = ascent.ceil() as i32;
     let des_i = descent.floor() as i32;
 
-    // split into lines: explicit newlines always break; greedy wrap at wrap_width
+    // split into lines: explicit newlines always break; greedy wrap at
+    // wrap_width — at spaces for latin, per-character for CJK text that has
+    // no spaces (Japanese breaks anywhere)
     let mut lines: Vec<String> = Vec::new();
     for para in tc.text.split('\n') {
         if tc.wrap_width <= 0.0 {
             lines.push(para.to_string());
+            continue;
+        }
+        let has_space = para.contains(' ');
+        if !has_space {
+            // per-char wrap
+            let mut cur = String::new();
+            let mut cur_w = 0.0f32;
+            for c in para.chars() {
+                let w = chain.metrics(c, px).advance_width + tc.tracking;
+                if !cur.is_empty() && cur_w + w > tc.wrap_width {
+                    lines.push(cur);
+                    cur = String::new();
+                    cur_w = 0.0;
+                }
+                cur.push(c);
+                cur_w += w;
+            }
+            lines.push(cur);
             continue;
         }
         let mut cur = String::new();
@@ -161,7 +252,7 @@ pub fn rasterize(tc: &TextContent) -> Result<(Vec<u8>, u32, u32)> {
         for word in para.split_inclusive(' ') {
             let w: f32 = word
                 .chars()
-                .map(|c| font.metrics(c, px).advance_width + tc.tracking)
+                .map(|c| chain.metrics(c, px).advance_width + tc.tracking)
                 .sum();
             if !cur.is_empty() && cur_w + w > tc.wrap_width {
                 lines.push(cur.trim_end().to_string());
@@ -169,7 +260,7 @@ pub fn rasterize(tc: &TextContent) -> Result<(Vec<u8>, u32, u32)> {
                 cur_w = word
                     .trim_start()
                     .chars()
-                    .map(|c| font.metrics(c, px).advance_width + tc.tracking)
+                    .map(|c| chain.metrics(c, px).advance_width + tc.tracking)
                     .sum();
             } else {
                 cur.push_str(word);
@@ -183,7 +274,7 @@ pub fn rasterize(tc: &TextContent) -> Result<(Vec<u8>, u32, u32)> {
     let mut rast = Vec::with_capacity(lines.len());
     let mut max_w = 0.0f32;
     for l in &lines {
-        let (glyphs, w, _above) = raster_line(&font, l, px, tc.tracking);
+        let (glyphs, w, _above) = raster_line(&mut chain, l, px, tc.tracking);
         max_w = max_w.max(w);
         rast.push(glyphs);
     }

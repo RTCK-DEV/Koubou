@@ -1,6 +1,109 @@
 import SwiftUI
 import AppKit
+import QuartzCore
 import PDFKit
+import UniformTypeIdentifiers
+
+// MARK: - Canvas overlay (separate NSWindow)
+
+/// SwiftUI defers every view update made inside a gesture — even
+/// @GestureState and AppKit `setNeedsDisplay` draws — until the mouse
+/// comes up: during event tracking the app's render pipeline pauses and
+/// window-surface *content* commits sit in the outbound queue. What DOES
+/// reach the WindowServer immediately are window-level ops: orderFront/
+/// orderOut/setFrame. So the marquee band and the drag outline are each
+/// a small borderless NSWindow with static styling (backgroundColor +
+/// a CALayer border committed at creation); mid-drag we only move and
+/// show/hide them — pure server-side operations that composite live.
+/// `CanvasOverlayNSView` is the invisible anchor filling the canvas that
+/// converts view-space rects to screen space and owns the windows.
+final class CanvasOverlayNSView: NSView {
+    private var bandWin: NSWindow?
+    private var outlineWin: NSWindow?
+    private static let accent =
+        NSColor(srgbRed: 1.0, green: 0.62, blue: 0.13, alpha: 1)
+
+    override func hitTest(_ p: NSPoint) -> NSView? { nil }
+
+    private func makeWindow(fill: NSColor?, border: NSColor?) -> NSWindow {
+        let ow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 4, height: 4),
+                          styleMask: .borderless,
+                          backing: .buffered, defer: false)
+        ow.backgroundColor = fill ?? .clear
+        ow.isOpaque = false
+        ow.hasShadow = false
+        ow.ignoresMouseEvents = true
+        ow.isReleasedWhenClosed = false
+        ow.level = .floating
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.borderWidth = border == nil ? 0 : 1
+        v.layer?.borderColor = border?.cgColor
+        ow.contentView = v
+        return ow
+    }
+
+    /// place/hide one overlay window for a view-coords rect
+    private func place(_ win: inout NSWindow?, viewRect r: CGRect?,
+                       fill: NSColor?, border: NSColor?) {
+        if let r = r, r.width > 0.5, r.height > 0.5, let w = window {
+            let sr = w.convertToScreen(convert(r, to: nil))
+            if win == nil { win = makeWindow(fill: fill, border: border) }
+            win?.setFrame(sr, display: false)
+            win?.orderFront(nil)
+        } else {
+            win?.orderOut(nil)
+        }
+    }
+
+    /// update the marquee band / moving outline; rects are view coords.
+    func setDraw(band: CGRect?, outline: CGRect?) {
+        place(&bandWin, viewRect: band,
+              fill: Self.accent.withAlphaComponent(0.3),
+              border: Self.accent)
+        place(&outlineWin, viewRect: outline,
+              fill: nil,
+              border: Self.accent.withAlphaComponent(0.9))
+    }
+
+    /// standalone windows outlive gesture state: if the canvas window
+    /// closes, miniaturises or the app resigns active while a band is up,
+    /// it would otherwise float forever — always hide on those transitions.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self)
+        guard let w = window else { return }
+        let hide: (Notification) -> Void = { [weak self] _ in
+            self?.setDraw(band: nil, outline: nil)
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: w, queue: .main,
+            using: hide)
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.didMiniaturizeNotification, object: w, queue: .main,
+            using: hide)
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil,
+            queue: .main, using: hide)
+    }
+
+    deinit {
+        bandWin?.orderOut(nil); outlineWin?.orderOut(nil)
+        NotificationCenter.default.removeObserver(self)
+    }
+}
+
+/// bridge: the representable lives in the ZStack; the store holds a
+/// weak ref so gesture callbacks can push rects straight to AppKit.
+private struct CanvasOverlay: NSViewRepresentable {
+    var doc: DocStore
+    func makeNSView(context: Context) -> CanvasOverlayNSView {
+        let v = CanvasOverlayNSView()
+        doc.overlay = v
+        return v
+    }
+    func updateNSView(_ v: CanvasOverlayNSView, context: Context) {}
+}
 
 // MARK: - Document store
 
@@ -20,11 +123,16 @@ struct DocLayer: Identifiable, Equatable {
     var text: [String: Any]?
     var fill: [String: Any]?
     var shapes: [[String: Any]]?
+    var children: [DocLayer] = []
+    /// {"dropShadow": {dx,dy,blur,spread,color:[r,g,b,a]}} or absent
+    var styles: [String: Any]?
 
     static func == (a: DocLayer, b: DocLayer) -> Bool {
         a.id == b.id && a.name == b.name && a.kind == b.kind
             && a.visible == b.visible && a.opacity == b.opacity
             && a.blend == b.blend && a.hasMask == b.hasMask
+            && a.x == b.x && a.y == b.y && a.scale == b.scale
+            && a.children.count == b.children.count
     }
 }
 
@@ -37,6 +145,25 @@ final class DocStore: ObservableObject {
     @Published var docH = 0
     @Published var composite: CGImage?
     @Published var selected: UInt64?
+    /// multi-select set from marquee/cmd-click — `selected` stays the primary
+    @Published var selectedSet: Set<UInt64> = []
+    /// canvas-visual state that must outlive gestures — the in-flight
+    /// drag visuals use @GestureState on the view instead.
+    @Published var hoverPt: CGPoint = .zero     // brush cursor position
+    /// on-canvas text editor: (layer id, draft)
+    @Published var textEdit: (id: UInt64, text: String)? = nil
+    /// AppKit overlay — repaints instantly mid-gesture, unlike SwiftUI
+    /// state which defers all view updates inside an HSplitView child
+    /// until the mouse comes up.
+    weak var overlay: CanvasOverlayNSView?
+    /// placed bounds in doc coords for every top-level layer (doc.bounds)
+    @Published var layerBounds: [UInt64: CGRect] = [:]
+    /// collapsed group ids in the layers panel
+    @Published var collapsed: Set<UInt64> = []
+    /// layer id currently being dragged in the layers panel
+    var draggingId: UInt64?
+    /// drop indicator: (target row id, edge, target's parent)
+    @Published var dropEdge: (id: UInt64, edge: DropEdge, parent: UInt64?)?
     @Published var busy = false
     @Published var dirty = false
     @Published var error: String?
@@ -49,7 +176,16 @@ final class DocStore: ObservableObject {
 
     private var pendingImageReload = false
 
-    var selLayer: DocLayer? { layers.first { $0.id == selected } }
+    /// recursive lookup — the inspector can edit nested group children
+    var selLayer: DocLayer? { selected.flatMap { Self.find($0, in: layers) } }
+
+    static func find(_ id: UInt64, in list: [DocLayer]) -> DocLayer? {
+        for l in list {
+            if l.id == id { return l }
+            if let f = find(id, in: l.children) { return f }
+        }
+        return nil
+    }
 
     private func ensure() -> DocSession? {
         if session == nil { session = DocSession() }
@@ -95,12 +231,117 @@ final class DocStore: ObservableObject {
         dirty = false
     }
 
-    func exportPNG() {
+    /// Export the composite. format: png|jpeg|tiff|psd
+    func exportAs(_ format: String) {
         let p = NSSavePanel()
-        p.allowedContentTypes = [.png]
-        p.nameFieldStringValue = (docName.isEmpty ? "Untitled" : docName) + ".png"
+        let ext = format == "jpeg" ? "jpg" : format
+        if let t = UTType(filenameExtension: ext) { p.allowedContentTypes = [t] }
+        p.nameFieldStringValue = (docName.isEmpty ? "Untitled" : docName) + "." + ext
         guard p.runModal() == .OK, let url = p.url else { return }
-        dispatch(["id": "doc.render", "out": url.path], then: .none)
+        if format == "psd" {
+            dispatch(["id": "doc.exportPsd", "path": url.path], then: .none)
+        } else {
+            dispatch(["id": "doc.render", "out": url.path,
+                      "format": format, "quality": 92], then: .none)
+        }
+    }
+
+    // ---- canvas tools ----
+
+    /// engine-side alpha-precise hit test at a document point
+    func pick(at pt: CGPoint, then hit: @escaping (UInt64?) -> Void) {
+        guard let s = ensure() else { return }
+        Task.detached { [weak self] in
+            let r = await s.work { sess in
+                sess.dispatch(["id": "doc.pick", "x": Double(pt.x), "y": Double(pt.y)])
+            }
+            let lid = (r["result"] as? [String: Any])?["layer"] as? NSNumber
+            await MainActor.run { hit(lid?.uint64Value) }
+            _ = self
+        }
+    }
+
+    /// client-side bounds hit test — instant, used for hover/outline only;
+    /// real drags go through `pick` (alpha+mask aware)
+    func layerAtBounds(_ pt: CGPoint) -> UInt64? {
+        for l in layers.reversed() where l.kind != "adjustment" {
+            if let b = layerBounds[l.id], b.contains(pt) { return l.id }
+        }
+        return nil
+    }
+
+    /// drag-move: absolute target for a layer's x/y (doc coords).
+    /// Optimistically updates parsed state + stored bounds so the
+    /// inspector/overlay stay in sync; the engine commit is throttled.
+    func moveLayerTo(_ id: UInt64, x: Double, y: Double) {
+        var d = CGPoint.zero
+        _ = Self.mutate(id, in: &layers) { l in
+            d = CGPoint(x: x - l.x, y: y - l.y)
+            l.x = x; l.y = y
+        }
+        if d != .zero, let b = layerBounds[id] {
+            layerBounds[id] = b.offsetBy(dx: d.x, dy: d.y)
+        }
+        setLayerThrottled(id, ["x": Int(x.rounded()), "y": Int(y.rounded())])
+    }
+
+    /// optimistic scale update for the scale-handle drag
+    func scaleLayerTo(_ id: UInt64, scale: Double) {
+        _ = Self.mutate(id, in: &layers) { l in l.scale = scale }
+        setLayerThrottled(id, ["scale": scale])
+    }
+
+    /// final commit at drag end: force the pending transform through
+    /// immediately (bypasses throttle), then re-fetch bounds + image.
+    func commitTransform(_ id: UInt64) {
+        throttleSeq += 1   // cancel the pending throttled write
+        guard let l = Self.find(id, in: layers) else { return }
+        setLayer(id, ["x": Int(l.x.rounded()), "y": Int(l.y.rounded()),
+                      "scale": l.scale], then: .reloadImage)
+        refreshBounds()
+    }
+
+    /// re-fetch per-layer bounds only (used after transforms)
+    func refreshBounds() {
+        guard let s = ensure() else { return }
+        Task.detached { [weak self] in
+            let rs = await s.work { sess in
+                sess.dispatch(["id": "doc.bounds"])
+            }
+            let rows = (rs["result"] as? [[String: Any]]) ?? []
+            var map: [UInt64: CGRect] = [:]
+            for r in rows {
+                if let lid = (r["layer"] as? NSNumber)?.uint64Value,
+                   let bb = r["bounds"] as? [NSNumber], bb.count == 4 {
+                    map[lid] = CGRect(x: bb[0].doubleValue, y: bb[1].doubleValue,
+                                      width: bb[2].doubleValue, height: bb[3].doubleValue)
+                }
+            }
+            await MainActor.run { self?.layerBounds = map }
+        }
+    }
+
+    /// recursive in-place mutation helper for nested layer arrays
+    @discardableResult
+    static func mutate(_ id: UInt64, in list: inout [DocLayer],
+                       _ f: (inout DocLayer) -> Void) -> Bool {
+        for i in list.indices {
+            if list[i].id == id { f(&list[i]); return true }
+            if mutate(id, in: &list[i].children, f) { return true }
+        }
+        return false
+    }
+
+    func groupSelection() {
+        var ids = selectedSet.filter { $0 != 0 }
+        if ids.count < 2, let s = selected { ids = [s] }
+        guard !ids.isEmpty else { return }
+        dispatch(["id": "doc.group", "layers": ids.map { $0 }, "name": "Group"])
+        selectedSet = []
+    }
+
+    func ungroup(_ id: UInt64) {
+        dispatch(["id": "doc.ungroup", "layer": id])
     }
 
     // ---- dispatch plumbing ----
@@ -134,17 +375,30 @@ final class DocStore: ObservableObject {
         }
     }
 
-    /// Batch: doc.json + preview render in one queue hop.
+    /// Batch: doc.json + bounds + preview render in one queue hop.
     func reloadState() {
         guard let s = session else { return }
         Task.detached { [weak self] in
-            let (doc, img) = await s.work { sess -> ([String: Any], CGImage?) in
+            let (doc, img, bounds) = await s.work { sess -> ([String: Any], CGImage?, [UInt64: CGRect]) in
                 let dj = sess.dispatch(["id": "doc.json"])["result"] as? [String: Any] ?? [:]
                 let img = Self.decodePNG(sess.dispatch(
                     ["id": "doc.render", "maxPx": self?.previewMaxPx ?? 1600]))
-                return (dj, img)
+                var bmap: [UInt64: CGRect] = [:]
+                if let arr = sess.dispatch(["id": "doc.bounds"])["result"] as? [[String: Any]] {
+                    for e in arr {
+                        if let id = (e["layer"] as? NSNumber)?.uint64Value,
+                           let b = e["bounds"] as? [NSNumber], b.count == 4 {
+                            bmap[id] = CGRect(x: b[0].doubleValue, y: b[1].doubleValue,
+                                              width: b[2].doubleValue, height: b[3].doubleValue)
+                        }
+                    }
+                }
+                return (dj, img, bmap)
             }
-            await MainActor.run { self?.applyState(doc, img) }
+            await MainActor.run {
+                self?.layerBounds = bounds
+                self?.applyState(doc, img)
+            }
         }
     }
 
@@ -179,9 +433,10 @@ final class DocStore: ObservableObject {
         let arr = doc["layers"] as? [[String: Any]] ?? []
         layers = arr.compactMap { Self.parseLayer($0) }
         if selected == nil { selected = layers.last?.id }
-        if let sel = selected, !layers.contains(where: { $0.id == sel }) {
+        if let sel = selected, Self.find(sel, in: layers) == nil {
             selected = layers.last?.id
         }
+        selectedSet = selectedSet.filter { Self.find($0, in: layers) != nil }
     }
 
     static func decodePNG(_ r: [String: Any]) -> CGImage? {
@@ -215,6 +470,9 @@ final class DocStore: ObservableObject {
         l.text = d["text"] as? [String: Any]
         l.fill = d["fill"] as? [String: Any]
         l.shapes = d["shapes"] as? [[String: Any]]
+        l.children = (d["children"] as? [[String: Any]] ?? [])
+            .compactMap { parseLayer($0) }
+        l.styles = d["styles"] as? [String: Any]
         return l
     }
 
@@ -287,6 +545,14 @@ final class DocStore: ObservableObject {
         let to = i + dir
         guard to >= 0, to < layers.count else { return }
         dispatch(["id": "doc.reorder", "layer": id, "to": to])
+    }
+
+    /// reparent/reorder via `doc.moveLayer`: parent nil = top level.
+    /// `to` is the index inside the parent list (0 = bottom).
+    func moveLayer(_ id: UInt64, parent: UInt64?, to: Int) {
+        var c: [String: Any] = ["id": "doc.moveLayer", "layer": id, "to": to]
+        if let p = parent { c["parent"] = p }
+        dispatch(c)
     }
 
     func setRecipe(_ id: UInt64, _ recipe: Recipe) {
@@ -395,6 +661,13 @@ final class DocStore: ObservableObject {
     }
 }
 
+extension CGPoint {
+    func distance(to o: CGPoint) -> CGFloat {
+        let dx = x - o.x, dy = y - o.y
+        return (dx * dx + dy * dy).squareRoot()
+    }
+}
+
 // MARK: - Blend modes
 
 let kBlendModes: [(key: String, label: String)] = [
@@ -464,8 +737,20 @@ struct DocEditorView: View {
             }
             Button("Save…") { doc.save() }
                 .buttonStyle(KouSecondaryButton())
-            Button("Export PNG…") { doc.exportPNG() }
-                .buttonStyle(KouPrimaryButton())
+            Menu {
+                Button("PNG…") { doc.exportAs("png") }
+                Button("JPEG…") { doc.exportAs("jpeg") }
+                Button("TIFF…") { doc.exportAs("tiff") }
+                Button("PSD (flat)…") { doc.exportAs("psd") }
+            } label: {
+                Text("Export")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .padding(.horizontal, 10).padding(.vertical, 5)
+            .background(Kou.accent).clipShape(RoundedRectangle(cornerRadius: 5))
+            .foregroundStyle(.black)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -481,7 +766,21 @@ struct DocEditorView: View {
 
     // ---- canvas ----
 
-    @State private var hoverPoint: CGPoint = .zero
+
+    /// what an in-progress drag is doing
+    private enum DragMode {
+        case none
+        case picking                    // waiting for doc.pick to answer
+        case moving(UInt64, CGPoint, CGPoint)   // layer, doc-space start, orig x/y
+        case marquee(CGPoint, CGPoint)          // start, current (view space)
+        case scaling(UInt64, CGPoint, Double, Double) // layer, bbox center, start dist, orig scale
+    }
+    @State private var dragMode: DragMode = .none
+    @State private var pickStarted = false
+    /// live gesture visuals — @GestureState updates mid-gesture,
+    /// unlike @State/@Published which defer until the gesture ends
+    /// live gesture span — drives all in-flight canvas visuals
+    /// (state writes inside gesture callbacks defer until release)
 
     private var canvas: some View {
         GeometryReader { geo in
@@ -498,34 +797,251 @@ struct DocEditorView: View {
                     ProgressView().tint(Kou.accent)
                         .position(x: geo.size.width / 2, y: geo.size.height / 2)
                 }
+
+                selectionOverlay(in: geo.size)
+                    .allowsHitTesting(false)
+
+                // in-flight drag visuals (marquee band / moving outline)
+                CanvasOverlay(doc: doc)
+                    .allowsHitTesting(false)
+
+                // on-canvas text editor
+                if let ed = doc.textEdit, let b = doc.layerBounds[ed.id] {
+                    let vr = viewRect(b, in: geo.size)
+                    TextEditor(text: Binding(
+                        get: { doc.textEdit?.text ?? "" },
+                        set: { doc.textEdit?.text = $0 }))
+                        .font(.system(size: max(12, vr.height / 3)))
+                        .foregroundStyle(.white)
+                        .scrollContentBackground(.hidden)
+                        .background(Kou.bg0.opacity(0.75))
+                        .overlay(RoundedRectangle(cornerRadius: 4)
+                            .stroke(Kou.accent, lineWidth: 1))
+                        .frame(width: max(vr.width, 140), height: max(vr.height, 44))
+                        .position(x: vr.midX, y: vr.midY)
+                        .onExitCommand { commitTextEdit() }
+                }
+
                 if doc.maskArmed {
                     Circle()
                         .stroke(Kou.accent, lineWidth: 1.5)
                         .frame(width: brushViewSize(in: geo.size),
                                height: brushViewSize(in: geo.size))
-                        .position(hoverPoint)
+                        .position(doc.hoverPt)
                         .allowsHitTesting(false)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Kou.bg0)
             .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { g in
-                        guard doc.maskArmed else { return }
-                        let pt = docPoint(g.location, in: geo.size)
-                        doc.paintMask(cx: Double(pt.x), cy: Double(pt.y))
-                    }
-            )
+            .gesture(canvasDrag(in: geo.size))
+            .onTapGesture(count: 2) { p in doubleTap(at: p, in: geo.size) }
             .onContinuousHover { phase in
                 switch phase {
-                case .active(let p): hoverPoint = p
+                case .active(let p): doc.hoverPt = p
                 case .ended: break
                 }
             }
         }
         .clipped()
+    }
+
+    /// corner handles on the selected layer's bounds + moving outline.
+    /// Hit-testing happens in the drag gesture (handles grab first).
+    @ViewBuilder
+    private func selectionOverlay(in size: CGSize) -> some View {
+        if !doc.maskArmed, let sel = doc.selected,
+           let b = doc.layerBounds[sel] {
+            let vr = viewRect(b, in: size)
+            // Photoshop-style transform box: accent border + 4 corner squares
+            Rectangle()
+                .strokeBorder(Kou.accent.opacity(0.9), lineWidth: 1)
+                .frame(width: vr.width, height: vr.height)
+                .position(x: vr.midX, y: vr.midY)
+            ForEach(0..<4, id: \.self) { corner in
+                let p = handlePoint(corner, of: vr)
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color.white)
+                    .frame(width: 9, height: 9)
+                    .overlay(RoundedRectangle(cornerRadius: 1.5)
+                        .stroke(Kou.accent, lineWidth: 1))
+                    .shadow(color: .black.opacity(0.4), radius: 1)
+                    .position(p)
+            }
+        }
+        // extra selected (marquee) layers get a dashed outline
+        ForEach(Array(doc.selectedSet.subtracting([doc.selected ?? 0])), id: \.self) { id in
+            if let b = doc.layerBounds[id] {
+                let vr = viewRect(b, in: size)
+                Rectangle()
+                    .strokeBorder(Kou.accent.opacity(0.5),
+                                  style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .frame(width: vr.width, height: vr.height)
+                    .position(x: vr.midX, y: vr.midY)
+            }
+        }
+    }
+
+    /// corner 0..3 → view-space position of a rect's corner
+    private func handlePoint(_ c: Int, of r: CGRect) -> CGPoint {
+        switch c {
+        case 0: return CGPoint(x: r.minX, y: r.minY)
+        case 1: return CGPoint(x: r.maxX, y: r.minY)
+        case 2: return CGPoint(x: r.maxX, y: r.maxY)
+        default: return CGPoint(x: r.minX, y: r.maxY)
+        }
+    }
+
+    /// doc-space rect → view-space rect
+    private func viewRect(_ docRect: CGRect, in size: CGSize) -> CGRect {
+        let rect = imageRect(in: size)
+        guard doc.docW > 0 else { return docRect }
+        let k = rect.width / CGFloat(doc.docW)
+        return CGRect(x: rect.minX + docRect.minX * k,
+                      y: rect.minY + docRect.minY * k,
+                      width: docRect.width * k, height: docRect.height * k)
+    }
+
+    /// main canvas gesture: mask paint > handle scale > move > marquee
+    private func canvasDrag(in size: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { g in
+                let dpt = docPoint(g.location, in: size)
+                let startDpt = docPoint(g.startLocation, in: size)
+                switch dragMode {
+                case .none:
+                    if doc.maskArmed {
+                        doc.paintMask(cx: Double(dpt.x), cy: Double(dpt.y))
+                        return
+                    }
+                    // corner handle grab? (view space, 9pt targets)
+                    if let sel = doc.selected, let b = doc.layerBounds[sel] {
+                        let vr = viewRect(b, in: size)
+                        let pts = (0..<4).map { handlePoint($0, of: vr) }
+                        for c in 0..<4 {
+                            if pts[c].distance(to: g.startLocation) <= 12 {
+                                let center = CGPoint(x: b.midX, y: b.midY)
+                                let d0 = startDpt.distance(to: center)
+                                let s0 = DocStore.find(sel, in: doc.layers)?.scale ?? 1
+                                dragMode = .scaling(sel, center, max(d0, 1), s0)
+                                return
+                            }
+                        }
+                    }
+                    // else pick once, then decide move vs marquee
+                    if !pickStarted {
+                        pickStarted = true
+                        dragMode = .picking
+                        doc.pick(at: startDpt) { lid in
+                            // user may have released before the answer arrived
+                            guard pickStarted else { return }
+                            if let lid {
+                                if let l = DocStore.find(lid, in: doc.layers) {
+                                    dragMode = .moving(lid, startDpt,
+                                                       CGPoint(x: l.x, y: l.y))
+                                    doc.selected = lid
+                                    doc.selectedSet = [lid]
+                                    return
+                                }
+                            }
+                            dragMode = .marquee(g.startLocation, g.startLocation)
+                        }
+                        return
+                    }
+                case .moving(let id, let start, let orig):
+                    let dx = dpt.x - start.x, dy = dpt.y - start.y
+                    doc.moveLayerTo(id, x: orig.x + dx, y: orig.y + dy)
+                    if let b = doc.layerBounds[id] {
+                        var vr = viewRect(b, in: size)
+                        let k = doc.docW > 0
+                            ? imageRect(in: size).width / CGFloat(doc.docW) : 1
+                        vr.origin.x += dx * k
+                        vr.origin.y += dy * k
+                        doc.overlay?.setDraw(band: nil, outline: vr)
+                    }
+                case .marquee(let start, _):
+                    dragMode = .marquee(start, g.location)
+                    let r = CGRect(
+                        x: min(start.x, g.location.x),
+                        y: min(start.y, g.location.y),
+                        width: abs(g.location.x - start.x),
+                        height: abs(g.location.y - start.y))
+                    doc.overlay?.setDraw(band: r, outline: nil)
+                case .scaling(let id, let center, let d0, let s0):
+                    let d = dpt.distance(to: center)
+                    let ns = s0 * (d / d0)
+                    if ns > 0.01, ns < 100 {
+                        doc.scaleLayerTo(id, scale: ns)
+                        if let b = doc.layerBounds[id] {
+                            let ob = CGRect(x: b.minX - (b.width * (ns - 1) / 2),
+                                            y: b.minY - (b.height * (ns - 1) / 2),
+                                            width: b.width * ns,
+                                            height: b.height * ns)
+                            doc.overlay?.setDraw(band: nil,
+                                                 outline: viewRect(ob, in: size))
+                        }
+                    }
+                case .picking:
+                    break
+                }
+            }
+            .onEnded { g in
+                defer {
+                    dragMode = .none
+                    pickStarted = false
+                    doc.overlay?.setDraw(band: nil, outline: nil)
+                }
+                switch dragMode {
+                case .moving(let id, _, _), .scaling(let id, _, _, _):
+                    doc.commitTransform(id)
+                default:
+                    break
+                }
+                if case .marquee(let a, let b) = dragMode {
+                    let mr = CGRect(x: min(a.x, b.x), y: min(a.y, b.y),
+                                    width: abs(a.x - b.x),
+                                    height: abs(a.y - b.y))
+                    let ra = docPoint(mr.origin, in: size)
+                    let rb = docPoint(
+                        CGPoint(x: mr.maxX, y: mr.maxY), in: size)
+                    let r = CGRect(x: min(ra.x, rb.x), y: min(ra.y, rb.y),
+                                   width: abs(ra.x - rb.x), height: abs(ra.y - rb.y))
+                    var hits = Set<UInt64>()
+                    for l in doc.layers where l.kind != "adjustment" {
+                        if let lb = doc.layerBounds[l.id], lb.intersects(r) {
+                            hits.insert(l.id)
+                        }
+                    }
+                    doc.selectedSet = hits
+                    // primary selection = topmost hit in stack order
+                    if let top = doc.layers.last(where: { hits.contains($0.id) }) {
+                        doc.selected = top.id
+                    }
+                }
+            }
+    }
+
+    /// double-click: pick → text layer opens the on-canvas editor
+    private func doubleTap(at p: CGPoint, in size: CGSize) {
+        let dpt = docPoint(p, in: size)
+        doc.pick(at: dpt) { lid in
+            guard let lid, let l = DocStore.find(lid, in: doc.layers),
+                  l.kind == "text" else {
+                if doc.textEdit != nil { commitTextEdit() }
+                return
+            }
+            doc.selected = lid
+            doc.textEdit = (lid, (l.text?["text"] as? String) ?? "")
+        }
+    }
+
+    private func commitTextEdit() {
+        if let ed = doc.textEdit {
+            var t = DocStore.find(ed.id, in: doc.layers)?.text ?? [:]
+            t["text"] = ed.text
+            doc.setLayer(ed.id, ["text": t], then: .reloadImage)
+        }
+        doc.textEdit = nil
     }
 
     private func imageRect(in size: CGSize) -> CGRect {
@@ -600,6 +1116,22 @@ struct DocEditorView: View {
                     Image(systemName: "trash").font(.system(size: 10))
                 }
                 .buttonStyle(.plain).foregroundStyle(Kou.text2)
+                // group / ungroup — PS ⌘G equivalents
+                Button { doc.groupSelection() } label: {
+                    Image(systemName: "folder.badge.plus").font(.system(size: 10))
+                }
+                .buttonStyle(.plain).foregroundStyle(Kou.text2)
+                .help("Group selected layers")
+                Button {
+                    if let s = doc.selected, doc.selLayer?.kind == "group" {
+                        doc.ungroup(s)
+                    }
+                } label: {
+                    Image(systemName: "folder.badge.minus").font(.system(size: 10))
+                }
+                .buttonStyle(.plain).foregroundStyle(
+                    doc.selLayer?.kind == "group" ? Kou.text2 : Kou.text3.opacity(0.5))
+                .help("Ungroup")
             }
             .padding(.horizontal, 10).padding(.vertical, 7)
             .overlay(alignment: .bottom) { Kou.hairline.frame(height: 1) }
@@ -626,10 +1158,7 @@ struct DocEditorView: View {
 
             ScrollView {
                 VStack(spacing: 2) {
-                    ForEach(doc.layers.reversed()) { l in
-                        LayerRow(doc: doc, layer: l, selected: doc.selected == l.id)
-                            .onTapGesture { doc.selected = l.id }
-                    }
+                    layerRows(doc.layers, depth: 0)
                     if doc.layers.isEmpty {
                         Text("No layers — add one with +")
                             .font(.system(size: 10)).foregroundStyle(Kou.text3)
@@ -637,6 +1166,57 @@ struct DocEditorView: View {
                     }
                 }
                 .padding(6)
+            }
+        }
+    }
+
+    /// recursive rows: groups render children indented under a disclosure
+    /// triangle; taps select, cmd-click adds to the marquee selection set;
+    /// rows are draggable — drop between rows to reorder, onto a group
+    /// row's middle band to reparent (Photoshop-style)
+    @ViewBuilder
+    private func layerRows(_ list: [DocLayer], depth: Int,
+                           parent: UInt64? = nil) -> some View {
+        ForEach(list.reversed()) { l in
+            let sel = doc.selected == l.id || doc.selectedSet.contains(l.id)
+            let edge = doc.dropEdge?.id == l.id
+                         && doc.dropEdge?.parent == parent ? doc.dropEdge?.edge : nil
+            LayerRow(doc: doc, layer: l, selected: sel, depth: depth,
+                     inside: edge == .inside)
+                .overlay(alignment: .top) {
+                    if edge == .above {
+                        Rectangle().fill(Kou.accent).frame(height: 2)
+                            .padding(.horizontal, 2)
+                    }
+                }
+                .overlay(alignment: .bottom) {
+                    if edge == .below {
+                        Rectangle().fill(Kou.accent).frame(height: 2)
+                            .padding(.horizontal, 2)
+                    }
+                }
+                .onTapGesture {
+                    if NSEvent.modifierFlags.contains(.command) {
+                        if doc.selectedSet.contains(l.id) {
+                            doc.selectedSet.remove(l.id)
+                        } else {
+                            doc.selectedSet.insert(l.id)
+                        }
+                    }
+                    doc.selected = l.id
+                    if !doc.selectedSet.contains(l.id) && doc.selectedSet.isEmpty {
+                        doc.selectedSet = [l.id]
+                    }
+                }
+                .onDrag {
+                    doc.draggingId = l.id
+                    return NSItemProvider(object: NSString(string: "\(l.id)"))
+                }
+                .onDrop(of: [.text], delegate: LayerDropDelegate(
+                    doc: doc, target: l, parentId: parent, siblings: list))
+            if l.kind == "group", !doc.collapsed.contains(l.id), !l.children.isEmpty {
+                // type-erased: recursive opaque types can't be inferred
+                AnyView(layerRows(l.children, depth: depth + 1, parent: l.id))
             }
         }
     }
@@ -660,13 +1240,88 @@ struct DocEditorView: View {
 
 // MARK: - Layer row
 
+enum DropEdge { case above, below, inside }
+
+/// Photoshop-style layer-panel drop target: top/bottom edges reorder within
+/// the target's parent; the middle band of a group row reparents into it.
+struct LayerDropDelegate: DropDelegate {
+    let doc: DocStore
+    let target: DocLayer
+    let parentId: UInt64?
+    let siblings: [DocLayer]      // stack order, bottom→top
+
+    private func edge(in info: DropInfo) -> DropEdge {
+        let h: CGFloat = 26
+        let y = info.location.y
+        if target.kind == "group", y > h * 0.3, y < h * 0.7 { return .inside }
+        return y < h / 2 ? .above : .below
+    }
+
+    /// is `needle` inside `hay`'s subtree (or hay itself)?
+    private func containsLayer(_ hay: DocLayer, _ needle: UInt64) -> Bool {
+        if hay.id == needle { return true }
+        return hay.children.contains { containsLayer($0, needle) }
+    }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        guard let d = doc.draggingId, d != target.id else { return false }
+        if let drag = DocStore.find(d, in: doc.layers),
+           containsLayer(drag, target.id) { return false }
+        return true
+    }
+
+    func dropEntered(info: DropInfo) {
+        doc.dropEdge = (target.id, edge(in: info), parentId)
+    }
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        doc.dropEdge = (target.id, edge(in: info), parentId)
+        return DropProposal(operation: .move)
+    }
+    func dropExited(info: DropInfo) {
+        if doc.dropEdge?.id == target.id { doc.dropEdge = nil }
+    }
+    func performDrop(info: DropInfo) -> Bool {
+        defer { doc.dropEdge = nil; doc.draggingId = nil }
+        guard let d = doc.draggingId, d != target.id else { return false }
+        if edge(in: info) == .inside {
+            doc.moveLayer(d, parent: target.id, to: target.children.count)
+            return true
+        }
+        guard let ti = siblings.firstIndex(where: { $0.id == target.id })
+        else { return false }
+        var to = edge(in: info) == .above ? ti + 1 : ti
+        // removal shifts the target index when the dragged layer sits below
+        if let di = siblings.firstIndex(where: { $0.id == d }), di < ti { to -= 1 }
+        doc.moveLayer(d, parent: parentId, to: max(to, 0))
+        return true
+    }
+}
+
 struct LayerRow: View {
     @ObservedObject var doc: DocStore
     let layer: DocLayer
     let selected: Bool
+    var depth: Int = 0
+    var inside: Bool = false
 
     var body: some View {
         HStack(spacing: 7) {
+            if layer.kind == "group" {
+                Image(systemName: doc.collapsed.contains(layer.id)
+                      ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(Kou.text3)
+                    .frame(width: 10)
+                    .onTapGesture {
+                        if doc.collapsed.contains(layer.id) {
+                            doc.collapsed.remove(layer.id)
+                        } else {
+                            doc.collapsed.insert(layer.id)
+                        }
+                    }
+            } else if depth > 0 {
+                Spacer().frame(width: 10)
+            }
             Image(systemName: layer.visible ? "eye" : "eye.slash")
                 .font(.system(size: 9))
                 .foregroundStyle(layer.visible ? Kou.text2 : Kou.text3)
@@ -682,6 +1337,11 @@ struct LayerRow: View {
                 .font(.system(size: 11, weight: selected ? .semibold : .regular))
                 .foregroundStyle(selected ? Kou.text1 : Kou.text2)
                 .lineLimit(1)
+            if layer.kind == "group" {
+                Text("\(layer.children.count)")
+                    .font(.system(size: 8).monospacedDigit())
+                    .foregroundStyle(Kou.text3)
+            }
             Spacer()
             if layer.hasMask {
                 Image(systemName: "rectangle.dashed")
@@ -697,10 +1357,11 @@ struct LayerRow: View {
             }
         }
         .padding(.horizontal, 7).padding(.vertical, 5)
-        .background(selected ? Kou.accentSoft : Color.clear)
+        .background(selected || inside ? Kou.accentSoft : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 5))
         .overlay(RoundedRectangle(cornerRadius: 5)
-            .stroke(selected ? Kou.accent.opacity(0.5) : Color.clear, lineWidth: 1))
+            .stroke(inside ? Kou.accent : (selected ? Kou.accent.opacity(0.5) : Color.clear),
+                    lineWidth: inside ? 1.5 : 1))
     }
 }
 
@@ -713,9 +1374,103 @@ struct LayerInspector: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             commonPanel
+            stylesPanel
             contentPanel
             maskPanel
         }
+    }
+
+    // ---- layer styles (drop shadow) ----
+
+    private var shadow: [String: Any]? {
+        layer.styles?["dropShadow"] as? [String: Any]
+    }
+
+    private var shadowOn: Bool { shadow != nil }
+
+    private func setShadow(_ changes: [String: Any]) {
+        var st = layer.styles ?? [:]
+        var ds = shadow ?? ["dx": 8.0, "dy": 8.0, "blur": 12.0, "spread": 0.0,
+                            "color": [0.0, 0.0, 0.0, 0.5]] as [String: Any]
+        for (k, v) in changes { ds[k] = v }
+        st["dropShadow"] = ds
+        doc.setLayerThrottled(layer.id, ["styles": st])
+    }
+
+    private func shadowVal(_ k: String, _ def: Double) -> Double {
+        (shadow?[k] as? NSNumber)?.doubleValue ?? def
+    }
+
+    private func shadowColor(_ i: Int) -> Binding<Double> {
+        Binding(
+            get: {
+                ((shadow?["color"] as? [Any])?
+                    .compactMap { ($0 as? NSNumber)?.doubleValue }[safe: i])
+                    ?? (i == 3 ? 0.5 : 0)
+            },
+            set: { nv in
+                var c = (shadow?["color"] as? [Any])?
+                    .compactMap { ($0 as? NSNumber)?.doubleValue } ?? [0, 0, 0, 0.5]
+                while c.count < 4 { c.append(i == 3 ? 0.5 : 0) }
+                c[i] = nv
+                setShadow(["color": c])
+            })
+    }
+
+    @ViewBuilder private var stylesPanel: some View {
+        if layer.kind != "group" && layer.kind != "adjustment" {
+            Panel("Layer Style", trailing: {
+                Toggle("", isOn: Binding(
+                    get: { shadowOn },
+                    set: { on in
+                        if on {
+                            setShadow([:])   // defaults
+                        } else {
+                            var st = layer.styles ?? [:]
+                            st.removeValue(forKey: "dropShadow")
+                            doc.setLayer(layer.id,
+                                         ["styles": st.isEmpty ? NSNull() : st],
+                                         then: .reloadImage)
+                        }
+                    }))
+                .labelsHidden().controlSize(.mini).tint(Kou.accent)
+            }) {
+                if shadowOn {
+                    DebSliderRow("Dist X", value: shadowVal("dx", 8),
+                                 range: -200...200, reset: 8) {
+                        setShadow(["dx": $0])
+                    }
+                    DebSliderRow("Dist Y", value: shadowVal("dy", 8),
+                                 range: -200...200, reset: 8) {
+                        setShadow(["dy": $0])
+                    }
+                    DebSliderRow("Blur", value: shadowVal("blur", 12),
+                                 range: 0...200, reset: 12) {
+                        setShadow(["blur": $0])
+                    }
+                    DebSliderRow("Spread", value: shadowVal("spread", 0),
+                                 range: 0...1, reset: 0) {
+                        setShadow(["spread": $0])
+                    }
+                    DebSliderRow("Color R", value: shadowColorVal(0, 0),
+                                 range: 0...1) { shadowColor(0).wrappedValue = $0 }
+                    DebSliderRow("Color G", value: shadowColorVal(1, 0),
+                                 range: 0...1) { shadowColor(1).wrappedValue = $0 }
+                    DebSliderRow("Color B", value: shadowColorVal(2, 0),
+                                 range: 0...1) { shadowColor(2).wrappedValue = $0 }
+                    DebSliderRow("Opacity", value: shadowColorVal(3, 0.5),
+                                 range: 0...1, reset: 0.5) { shadowColor(3).wrappedValue = $0 }
+                } else {
+                    Text("Drop shadow off — toggle to enable.")
+                        .font(.system(size: 9.5)).foregroundStyle(Kou.text3)
+                }
+            }
+        }
+    }
+
+    private func shadowColorVal(_ i: Int, _ def: Double) -> Double {
+        ((shadow?["color"] as? [Any])?
+            .compactMap { ($0 as? NSNumber)?.doubleValue }[safe: i]) ?? def
     }
 
     private var commonPanel: some View {
@@ -819,15 +1574,63 @@ struct LayerInspector: View {
 
 // MARK: - recipe inspector (develop / adjustment layers)
 
+/// DaVinci-style tabbed inspector covering every engine recipe field —
+/// reuses the same components the photo editor palettes use.
+enum DocPalette: String, CaseIterable, Identifiable {
+    case light, wheels, curves, zones, qualifier, windows, mixer, detail, fx
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .light: return "Light"
+        case .wheels: return "Wheels"
+        case .curves: return "Curves"
+        case .zones: return "HDR Zones"
+        case .qualifier: return "Qualifier"
+        case .windows: return "Windows"
+        case .mixer: return "Mixer"
+        case .detail: return "Detail"
+        case .fx: return "Effects"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .light: return "sun.max"
+        case .wheels: return "circle.circle"
+        case .curves: return "chart.line.uptrend.xyaxis"
+        case .zones: return "square.split.bottomhalf.filled"
+        case .qualifier: return "eyedropper.halffull"
+        case .windows: return "circle.dashed"
+        case .mixer: return "slider.horizontal.below.square.filled.and.square"
+        case .detail: return "sparkle.magnifyingglass"
+        case .fx: return "sparkles"
+        }
+    }
+}
+
 struct RecipeInspector: View {
     let layer: DocLayer
     @State var recipe: Recipe
     var onChange: (Recipe) -> Void
     @State private var debounce: Task<Void, Never>?
+    @State private var pal: DocPalette = .light
+    @State private var curveCh = 0
 
     init(layer: DocLayer, recipe: Recipe, onChange: @escaping (Recipe) -> Void) {
         self.layer = layer
-        self._recipe = State(initialValue: recipe)
+        var r = recipe
+        // pad fixed-size arrays so indexed controls never trap on a
+        // malformed/short decoded recipe
+        func pad(_ kp: WritableKeyPath<Recipe, [Double]>, _ n: Int,
+                 _ fill: Double = 0) {
+            while r[keyPath: kp].count < n { r[keyPath: kp].append(fill) }
+        }
+        pad(\.qh, 3); pad(\.qs, 3); pad(\.ql, 3); pad(\.qadj, 4)
+        pad(\.q_clean, 2); pad(\.z_dark, 4); pad(\.z_shadow, 4)
+        pad(\.z_light, 4); pad(\.z_global, 4); pad(\.mixer, 9)
+        pad(\.zones_ev, 9); pad(\.mono, 3); pad(\.lift, 3)
+        pad(\.gamma, 3, 1); pad(\.gain, 3, 1); pad(\.offset, 3)
+        pad(\.flare, 4); pad(\.crop, 4); pad(\.wb_pick, 2, 0.5)
+        self._recipe = State(initialValue: r)
         self.onChange = onChange
     }
 
@@ -846,44 +1649,357 @@ struct RecipeInspector: View {
                 set: { recipe[keyPath: kp] = $0; push() })
     }
 
+    private func b3(_ kp: WritableKeyPath<Recipe, [Double]>) -> Binding<[Double]> {
+        Binding(get: { recipe[keyPath: kp] },
+                set: { recipe[keyPath: kp] = $0; push() })
+    }
+
+    private func bBool(_ kp: WritableKeyPath<Recipe, Bool>) -> Binding<Bool> {
+        Binding(get: { recipe[keyPath: kp] },
+                set: { recipe[keyPath: kp] = $0; push() })
+    }
+
+    /// safe indexed binding: pads short decoded arrays before writing so a
+    /// malformed recipe can't crash the inspector
+    private func bi(_ kp: WritableKeyPath<Recipe, [Double]>, _ i: Int,
+                    _ def: Double = 0) -> Binding<Double> {
+        Binding(
+            get: { recipe[keyPath: kp][safe: i] ?? def },
+            set: { nv in
+                while recipe[keyPath: kp].count <= i {
+                    recipe[keyPath: kp].append(def)
+                }
+                recipe[keyPath: kp][i] = nv
+                push()
+            })
+    }
+
+    private func bc(_ kp: WritableKeyPath<Recipe, [[Double]]>) -> Binding<[[Double]]> {
+        Binding(get: { recipe[keyPath: kp] },
+                set: { recipe[keyPath: kp] = $0; push() })
+    }
+
+    private func curveBinding(_ ch: Int) -> Binding<[[Double]]> {
+        switch ch {
+        case 0: return bc(\.curve)
+        case 1: return bc(\.curve_r)
+        case 2: return bc(\.curve_g)
+        case 3: return bc(\.curve_b)
+        case 4: return bc(\.hue_hue)
+        case 5: return bc(\.hue_sat)
+        case 6: return bc(\.hue_lum)
+        case 7: return bc(\.lum_sat)
+        default: return bc(\.sat_sat)
+        }
+    }
+
+    private func curveName(_ ch: Int) -> String {
+        ["Luma", "Red", "Green", "Blue", "Hue vs Hue", "Hue vs Sat",
+         "Hue vs Lum", "Lum vs Sat", "Sat vs Sat"][ch]
+    }
+
+    private func curveTint(_ ch: Int) -> Color {
+        [Color.white, .red, .green, .blue, Kou.accent, Kou.accent, Kou.accent,
+         Kou.accent, Kou.accent][ch]
+    }
+
     var body: some View {
-        Panel(layer.kind == "develop" ? "Develop" : "Adjustment") {
+        // palette strip — same icon chips as the photo editor
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 5) {
+                ForEach(DocPalette.allCases) { p in
+                    VStack(spacing: 2) {
+                        Image(systemName: p.icon).font(.system(size: 11))
+                        Text(p.title).font(.system(size: 7))
+                    }
+                    .frame(width: 40, height: 34)
+                    .background(pal == p ? Kou.accentSoft : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .foregroundStyle(pal == p ? Kou.accent : Kou.text3)
+                    .onTapGesture { pal = p }
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+
+        Group {
+            switch pal {
+            case .light: lightPal
+            case .wheels: wheelsPal
+            case .curves: curvesPal
+            case .zones: zonesPal
+            case .qualifier: qualifierPal
+            case .windows: windowsPal
+            case .mixer: mixerPal
+            case .detail: detailPal
+            case .fx: fxPal
+            }
+        }
+    }
+
+    // ---- palettes ----
+
+    private var lightPal: some View {
+        VStack(alignment: .leading, spacing: 10) {
             if layer.kind == "adjustment" {
                 Text("Crop/rotate/keystone are ignored on adjustment layers.")
                     .font(.system(size: 9)).foregroundStyle(Kou.text3)
             }
-            SegPicker([(WbMode.asShot, "As Shot"), (.auto, "Auto"),
-                       (.manual, "Manual")],
-                      selection: Binding(get: { recipe.wb_mode },
-                                         set: { recipe.wb_mode = $0; push() }))
-            SliderRow("Temp", b(\.temperature), -1...1, track: Kou.tempTrack)
-            SliderRow("Tint", b(\.tint), -1...1, track: Kou.tintTrack)
+            Panel("White Balance") {
+                SegPicker([(WbMode.asShot, "As Shot"), (.auto, "Auto"),
+                           (.manual, "Manual")],
+                          selection: Binding(get: { recipe.wb_mode },
+                                             set: { recipe.wb_mode = $0; push() }))
+                SliderRow("Temp", b(\.temperature), -1...1, track: Kou.tempTrack)
+                SliderRow("Tint", b(\.tint), -1...1, track: Kou.tintTrack)
+            }
+            Panel("Tone") {
+                SliderRow("Exposure", b(\.exposure), -4...4, step: 0.05)
+                SliderRow("Contrast", b(\.contrast), -1...1)
+                SliderRow("Pivot", b(\.pivot), 0.05...0.5, reset: 0.18)
+                SliderRow("Highlights", b(\.highlights), -1...1)
+                SliderRow("Shadows", b(\.shadows), -1...1)
+                SliderRow("Whites", b(\.whites), -1...1)
+                SliderRow("Blacks", b(\.blacks), -1...1)
+                SliderRow("Hi Rolloff", b(\.highlight_rolloff), 0...2, reset: 1)
+                SliderRow("Sh Rolloff", b(\.shadow_rolloff), 0...2, reset: 1)
+            }
+            Panel("Color") {
+                SliderRow("Saturation", b(\.saturation), -1...1)
+                SliderRow("Vibrance", b(\.vibrance), -1...1)
+            }
+            Panel("Auto") {
+                Toggle("Auto Exposure", isOn: bBool(\.auto_exposure))
+                    .font(.system(size: 10.5)).foregroundStyle(Kou.text2)
+                    .controlSize(.mini).tint(Kou.accent)
+                Toggle("Auto Contrast", isOn: bBool(\.auto_contrast))
+                    .font(.system(size: 10.5)).foregroundStyle(Kou.text2)
+                    .controlSize(.mini).tint(Kou.accent)
+            }
         }
-        Panel("Tone") {
-            SliderRow("Exposure", b(\.exposure), -4...4, step: 0.05)
-            SliderRow("Contrast", b(\.contrast), -1...1)
-            SliderRow("Highlights", b(\.highlights), -1...1)
-            SliderRow("Shadows", b(\.shadows), -1...1)
-            SliderRow("Whites", b(\.whites), -1...1)
-            SliderRow("Blacks", b(\.blacks), -1...1)
+    }
+
+    private var wheelsPal: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Color Wheels") {
+                HStack(spacing: 8) {
+                    ColorWheel(title: "Lift", v: b3(\.lift), center: 0)
+                    ColorWheel(title: "Gamma", v: b3(\.gamma), center: 1)
+                    ColorWheel(title: "Gain", v: b3(\.gain), center: 1)
+                }
+                .frame(height: 86)
+                ColorWheel(title: "Offset", v: b3(\.offset), center: 0)
+                    .frame(height: 86)
+            }
+            Panel("Split Tone") {
+                SliderRow("Shd Hue", b(\.shadow_hue), 0...1, track: Kou.hueTrack)
+                SliderRow("Shd Sat", b(\.shadow_sat), 0...1)
+                SliderRow("Hi Hue", b(\.highlight_hue), 0...1, track: Kou.hueTrack)
+                SliderRow("Hi Sat", b(\.highlight_sat), 0...1)
+                SliderRow("Mid Hue", b(\.midtone_hue), 0...1, track: Kou.hueTrack)
+                SliderRow("Mid Sat", b(\.midtone_sat), 0...1)
+            }
+            Panel("3D LUT") {
+                HStack(spacing: 6) {
+                    Text(recipe.lut_file.isEmpty ? "No LUT" :
+                         URL(fileURLWithPath: recipe.lut_file).lastPathComponent)
+                        .font(.system(size: 10)).foregroundStyle(Kou.text2)
+                        .lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    ToolChip(label: "Pick .cube", icon: "folder") { pickLut() }
+                    if !recipe.lut_file.isEmpty {
+                        ToolChip(label: "Clear", icon: "xmark") {
+                            recipe.lut_file = ""; push()
+                        }
+                    }
+                }
+                SliderRow("Amount", b(\.lut_amount), 0...1, reset: 1)
+            }
         }
-        Panel("Color") {
-            SliderRow("Saturation", b(\.saturation), -1...1)
-            SliderRow("Vibrance", b(\.vibrance), -1...1)
-            SliderRow("Shd Sat", b(\.shadow_sat), 0...1)
-            SliderRow("Hi Sat", b(\.highlight_sat), 0...1)
+    }
+
+    private func pickLut() {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = [UTType(filenameExtension: "cube") ?? .data]
+        if p.runModal() == .OK, let url = p.url {
+            recipe.lut_file = url.path
+            push()
         }
-        Panel("Detail") {
-            SliderRow("Sharpen", b(\.sharpen), 0...2)
-            SliderRow("NR Luma", b(\.noise_luma), 0...1)
-            SliderRow("NR Chroma", b(\.noise_chroma), 0...1)
-            SliderRow("Clarity", b(\.clarity), -1...1)
+    }
+
+    private var curvesPal: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Curves") {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        ForEach(0..<9, id: \.self) { ch in
+                            Text(curveName(ch))
+                                .font(.system(size: 8,
+                                              weight: curveCh == ch ? .bold : .regular))
+                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .background(curveCh == ch ? Kou.accentSoft : Color.clear)
+                                .clipShape(Capsule())
+                                .foregroundStyle(curveCh == ch ? Kou.accent : Kou.text3)
+                                .onTapGesture { curveCh = ch }
+                        }
+                    }
+                }
+                CurveEditor(points: curveBinding(curveCh), tint: curveTint(curveCh),
+                            spectrum: curveCh >= 4)
+                    .frame(height: 150)
+            }
         }
-        Panel("Effects") {
-            SliderRow("Vignette", b(\.vignette), -1...1)
-            SliderRow("Grain", b(\.grain), 0...1)
-            SliderRow("Glow", b(\.glow), 0...1)
-            SliderRow("Beauty", b(\.beauty), 0...1)
+    }
+
+    private var zonesPal: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Tone Equalizer") {
+                ZoneEQ(zones: b3(\.zones_ev))
+            }
+            Panel("HDR Zones") {
+                ZoneRow("Dark", b3(\.z_dark))
+                ZoneRow("Shadow", b3(\.z_shadow))
+                ZoneRow("Light", b3(\.z_light))
+                ZoneRow("Global", b3(\.z_global))
+            }
+        }
+    }
+
+    private var qualifierPal: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Qualifier", trailing: {
+                HStack(spacing: 6) {
+                    Toggle("", isOn: bBool(\.q_enabled))
+                        .labelsHidden().controlSize(.mini).tint(Kou.accent)
+                    ToolChip(label: "Show", icon: "eye",
+                             active: recipe.q_show) {
+                        recipe.q_show.toggle(); push()
+                    }
+                }
+            }) {
+                RangeBar(title: "Hue", lo: bi(\.qh, 0, 0.5), hi: bi(\.qh, 1, 0.1),
+                         gradient: Kou.hueTrack)
+                SliderRow("H Soft", bi(\.qh, 2, 0.1), 0...0.5, reset: 0.1)
+                RangeBar(title: "Sat", lo: bi(\.qs, 0), hi: bi(\.qs, 1, 1),
+                         gradient: LinearGradient(colors: [.gray, .red],
+                                                  startPoint: .leading, endPoint: .trailing))
+                SliderRow("S Soft", bi(\.qs, 2, 0.1), 0...0.5, reset: 0.1)
+                RangeBar(title: "Lum", lo: bi(\.ql, 0), hi: bi(\.ql, 1, 1),
+                         gradient: LinearGradient(colors: [.black, .white],
+                                                  startPoint: .leading, endPoint: .trailing))
+                SliderRow("L Soft", bi(\.ql, 2, 0.1), 0...0.5, reset: 0.1)
+                Toggle("Invert matte", isOn: bBool(\.q_invert))
+                    .font(.system(size: 10.5)).foregroundStyle(Kou.text2)
+                    .controlSize(.mini).tint(Kou.accent)
+            }
+            Panel("Adjust Selection") {
+                SliderRow("Hue Shift", bi(\.qadj, 0), -0.5...0.5, track: Kou.hueTrack)
+                SliderRow("Sat", bi(\.qadj, 1), -1...1)
+                SliderRow("Lum", bi(\.qadj, 2), -1...1)
+                SliderRow("Temp", bi(\.qadj, 3), -1...1, track: Kou.tempTrack)
+            }
+            Panel("Matte Finesse") {
+                SliderRow("Clean Blk", bi(\.q_clean, 0), 0...1)
+                SliderRow("Clean Wht", bi(\.q_clean, 1, 1), 0...1, reset: 1)
+                SliderRow("Edge Blur", b(\.q_blur), 0...1)
+            }
+        }
+    }
+
+    private var windowsPal: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Power Windows", trailing: {
+                HStack(spacing: 6) {
+                    ToolChip(label: "Circle", icon: "plus.circle") {
+                        var w = PowerWindow()
+                        w.kind = "circle"
+                        recipe.windows.append(w); push()
+                    }
+                    ToolChip(label: "Grad", icon: "plus.rectangle") {
+                        var w = PowerWindow()
+                        w.kind = "gradient"
+                        w.p = [0.3, 0.3, 0.7, 0.7, 0.4, 0]
+                        recipe.windows.append(w); push()
+                    }
+                }
+            }) {
+                if recipe.windows.isEmpty {
+                    Text("Add a circle or gradient window to isolate a region.")
+                        .font(.system(size: 10)).foregroundStyle(Kou.text3)
+                }
+                ForEach(recipe.windows.indices, id: \.self) { i in
+                    WindowRow(w: Binding(
+                        get: { recipe.windows[safe: i] ?? PowerWindow() },
+                        set: {
+                            if i < recipe.windows.count { recipe.windows[i] = $0 }
+                            push()
+                        })) {
+                        recipe.windows.remove(at: i); push()
+                    }
+                }
+            }
+        }
+    }
+
+    private var mixerPal: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("RGB Mixer") {
+                VStack(spacing: 5) {
+                    ForEach(0..<3, id: \.self) { row in
+                        HStack(spacing: 5) {
+                            Text(["R′", "G′", "B′"][row])
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle([Color.red.opacity(0.9),
+                                                  .green.opacity(0.9),
+                                                  .blue.opacity(0.9)][row])
+                                .frame(width: 14, alignment: .leading)
+                            MixRow(Binding(
+                                get: { recipe.mixer },
+                                set: { recipe.mixer = $0; push() }), row: row)
+                        }
+                    }
+                }
+                HStack {
+                    Text("Monochrome").font(.system(size: 10.5)).foregroundStyle(Kou.text2)
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { recipe.mono != [0, 0, 0] },
+                        set: { recipe.mono = $0 ? [0.21, 0.72, 0.07] : [0, 0, 0]; push() }
+                    ))
+                    .labelsHidden().controlSize(.mini).tint(Kou.accent)
+                }
+                if recipe.mono != [0, 0, 0] {
+                    TriRow("Mono", b3(\.mono), 0...1)
+                }
+            }
+        }
+    }
+
+    private var detailPal: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Detail") {
+                SliderRow("Sharpen", b(\.sharpen), 0...2)
+                SliderRow("NR Luma", b(\.noise_luma), 0...1)
+                SliderRow("NR Chroma", b(\.noise_chroma), 0...1)
+                SliderRow("Deband", b(\.deband), 0...1)
+                SliderRow("CA Fix", b(\.ca_fix), 0...1)
+                SliderRow("Beauty", b(\.beauty), 0...1)
+            }
+        }
+    }
+
+    private var fxPal: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Panel("Effects") {
+                SliderRow("Clarity", b(\.clarity), -1...1)
+                SliderRow("Vignette", b(\.vignette), -1...1)
+                SliderRow("Grain", b(\.grain), 0...1)
+                SliderRow("Glow", b(\.glow), 0...1)
+                SliderRow("Flare", bi(\.flare, 2), 0...1)
+                SliderRow("Fl Hue", bi(\.flare, 3), 0...1, track: Kou.hueTrack)
+                SliderRow("Fl X", bi(\.flare, 0, 0.5), 0...1, reset: 0.5)
+                SliderRow("Fl Y", bi(\.flare, 1, 0.5), 0...1, reset: 0.5)
+            }
         }
     }
 }

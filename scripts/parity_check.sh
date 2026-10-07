@@ -5,7 +5,10 @@ set -u
 cd "$(dirname "$0")/.."
 
 cited=$(grep -o 'cmd:[a-zA-Z.]*' docs/parity.md | sed 's/^cmd://' | sort -u)
-known=$(awk '/pub fn command_ids/,/^    }/' composer/src/commands.rs | grep -o '"[a-zA-Z.]*"' | tr -d '"' | sort -u)
+# Session::command_ids aggregates the domain sessions' lists: base ids in
+# composer/src/commands.rs, tl.* in motion/src/session.rs, pg.* in
+# pages/src/session.rs — extract literals from all three.
+known=$(awk '/pub fn command_ids/,/^    }/' composer/src/commands.rs motion/src/session.rs pages/src/session.rs | grep -o '"[a-zA-Z.]*"' | tr -d '"' | sort -u)
 
 missing=0
 for id in $cited; do

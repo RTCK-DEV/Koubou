@@ -56,6 +56,9 @@ fn is_mutating(id: &str) -> bool {
         "doc.json"
             | "doc.render"
             | "doc.exportLayer"
+            | "doc.exportPsd"
+            | "doc.pick"
+            | "doc.bounds"
             | "doc.info"
             | "doc.save"
             | "doc.undo"
@@ -185,6 +188,17 @@ impl Session {
             .iter()
             .map(|d| self.undo.get(*d).map(|s| s.len()).unwrap_or(0))
             .collect();
+        // successful sub-commands clear their domain's redo stack — keep a
+        // copy so a failed atomic batch restores redo too, not just state
+        let redo_snaps: Vec<Vec<Value>> = domains
+            .iter()
+            .map(|d| {
+                self.redo
+                    .get(*d)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default()
+            })
+            .collect();
         let mut results = Vec::with_capacity(list.len());
         for (i, sub) in list.iter().enumerate() {
             let r = self.dispatch_one(sub, true);
@@ -196,6 +210,11 @@ impl Session {
                         self.domain_restore(d, snap.clone())?;
                         if let Some(s) = self.undo.get_mut(*d) {
                             s.truncate(undo_lens[i2]);
+                        }
+                        let rs = self.redo.entry(*d).or_default();
+                        rs.clear();
+                        for v in redo_snaps[i2].iter().cloned() {
+                            rs.push_back(v);
                         }
                     }
                     let err = r
@@ -302,8 +321,13 @@ impl Session {
     }
 
     /// the command ids this dispatcher understands (parity checks read this)
-    pub fn command_ids() -> &'static [&'static str] {
-        static IDS: &[&str] = &[
+    /// every command id this session understands. The doc/misc ids are
+    /// owned here; the tl.*/pg.* ids come from the domain sessions so a
+    /// new motion/pages command is reachable (and MCP-visible) without
+    /// touching this list. tl/pg undo/redo stay here — the unified undo
+    /// router dispatches on them itself.
+    pub fn command_ids() -> Vec<&'static str> {
+        static BASE: &[&str] = &[
             "ping",
             "commands",
             "scan",
@@ -328,6 +352,7 @@ impl Session {
             "doc.removeLayer",
             "doc.duplicateLayer",
             "doc.reorder",
+            "doc.moveLayer",
             "doc.mergeDown",
             "doc.flatten",
             "doc.resize",
@@ -335,56 +360,30 @@ impl Session {
             "doc.setBackdrop",
             "doc.render",
             "doc.exportLayer",
+            "doc.exportPsd",
+            "doc.pick",
+            "doc.bounds",
             "doc.maskPaint",
+            "doc.maskRect",
             "doc.maskInvert",
+            "doc.group",
+            "doc.ungroup",
             "doc.addShape",
             "doc.shapeSet",
             "doc.shapeRemove",
             "doc.undo",
             "doc.redo",
-            // motion domain (koubou-motion / .kmotion)
-            "tl.new",
-            "tl.open",
-            "tl.save",
-            "tl.json",
-            "tl.addTrack",
-            "tl.setTrack",
-            "tl.removeTrack",
-            "tl.addClip",
-            "tl.setClip",
-            "tl.removeClip",
-            "tl.splitClip",
-            "tl.duplicateClip",
-            "tl.addCue",
-            "tl.setCue",
-            "tl.removeCue",
-            "tl.probe",
-            "tl.renderFrame",
-            "tl.render",
-            "tl.detectSilence",
-            "tl.generateClip",
+            // cross-domain undo routing is owned by this session
             "tl.undo",
             "tl.redo",
-            // pages domain (koubou-pages / .kpages)
-            "pg.new",
-            "pg.open",
-            "pg.save",
-            "pg.json",
-            "pg.addPage",
-            "pg.addMaster",
-            "pg.removePage",
-            "pg.duplicatePage",
-            "pg.addFrame",
-            "pg.setFrame",
-            "pg.removeFrame",
-            "pg.moveFrame",
-            "pg.setMaster",
-            "pg.render",
-            "pg.renderPng",
             "pg.undo",
             "pg.redo",
         ];
-        IDS
+        BASE.iter()
+            .copied()
+            .chain(koubou_motion::TlSession::command_ids())
+            .chain(koubou_pages::PgSession::command_ids())
+            .collect()
     }
 
     fn run(&mut self, id: &str, v: &Value) -> Result<Value> {
@@ -527,6 +526,18 @@ impl Session {
                 }
                 Ok(json!("ok"))
             }
+            "doc.moveLayer" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let parent = v.get("parent").and_then(Value::as_u64);
+                let to = v.get("to").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if !c.doc.move_layer(id, parent, to) {
+                    anyhow::bail!(
+                        "cannot move layer {id} (missing, or target is not a group, or cycle)"
+                    );
+                }
+                Ok(json!("ok"))
+            }
             "doc.render" => {
                 let c = self.composer.as_mut().context("no document")?;
                 let max = v.get("maxPx").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -535,7 +546,137 @@ impl Session {
                 } else {
                     c.render()?
                 };
-                write_image(&img, v.get("out").and_then(Value::as_str))
+                write_image_fmt(
+                    &img,
+                    v.get("out").and_then(Value::as_str),
+                    v.get("format").and_then(Value::as_str).unwrap_or("png"),
+                    v.get("quality").and_then(Value::as_f64).unwrap_or(90.0) as u8,
+                )
+            }
+            "doc.exportPsd" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let p = req_str(v, "path")?;
+                let img = c.render()?;
+                crate::psd::write_flat_psd(Path::new(&p), img.width, img.height, &img.data)?;
+                Ok(json!({"path": p}))
+            }
+            "doc.pick" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let x = v.get("x").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+                let y = v.get("y").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+                match c.pick(x, y)? {
+                    Some(id) => Ok(json!({"layer": id})),
+                    None => Ok(json!({"layer": Value::Null})),
+                }
+            }
+            "doc.bounds" => {
+                let c = self.composer.as_mut().context("no document")?;
+                match v.get("layer").and_then(Value::as_u64) {
+                    Some(id) => {
+                        let b = c.layer_bounds(id)?;
+                        Ok(json!({"layer": id, "bounds": b}))
+                    }
+                    None => {
+                        let all = c.all_bounds();
+                        Ok(json!(all
+                            .iter()
+                            .map(|(id, b)| json!({"layer": id, "bounds": b}))
+                            .collect::<Vec<_>>()))
+                    }
+                }
+            }
+            "doc.maskRect" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let x = v.get("x").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+                let y = v.get("y").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+                let w = req_u64(v, "w")? as u32;
+                let h = req_u64(v, "h")? as u32;
+                let feather = v.get("feather").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+                let (dw, dh) = (c.doc.width, c.doc.height);
+                let l = c.doc.layer_mut(id).context("layer not found")?;
+                // rect mask: 1 inside the rect, 0 outside — replaces the mask
+                let mut m = Mask {
+                    width: dw,
+                    height: dh,
+                    data: vec![0.0; (dw * dh) as usize],
+                    inverted: false,
+                    density: 1.0,
+                    feather,
+                };
+                let (x0, y0) = (x.max(0.0) as u32, y.max(0.0) as u32);
+                let x1 = ((x + w as f32).ceil() as u32).min(dw);
+                let y1 = ((y + h as f32).ceil() as u32).min(dh);
+                for py in y0.min(dh)..y1 {
+                    for px in x0.min(dw)..x1 {
+                        m.data[(py * dw + px) as usize] = 1.0;
+                    }
+                }
+                l.mask = Some(m);
+                l.gen += 1;
+                Ok(json!("ok"))
+            }
+            "doc.group" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let name = v.get("name").and_then(Value::as_str).unwrap_or("Group");
+                // wrap the given layers (or all when absent) preserving order
+                let ids: Vec<u64> = v
+                    .get("layers")
+                    .and_then(|a| serde_json::from_value::<Vec<u64>>(a.clone()).ok())
+                    .unwrap_or_else(|| c.doc.layers.iter().map(|l| l.id).collect());
+                if ids.is_empty() {
+                    anyhow::bail!("no layers to group");
+                }
+                // top-level members determine where the group lands:
+                // above the highest one. Nested members keep coming along
+                // but don't occupy top-level slots.
+                let top_ids: std::collections::HashSet<u64> =
+                    c.doc.layers.iter().map(|l| l.id).collect();
+                let pos = ids
+                    .iter()
+                    .filter(|id| top_ids.contains(*id))
+                    .filter_map(|id| c.doc.index_of(*id))
+                    .max();
+                let mut members = Vec::with_capacity(ids.len());
+                for id in &ids {
+                    if let Some(l) = c.doc.remove_layer(*id) {
+                        members.push(l);
+                    }
+                }
+                if members.is_empty() {
+                    anyhow::bail!("no layers to group");
+                }
+                let top_n = members.iter().filter(|l| top_ids.contains(&l.id)).count();
+                let mut g = Layer::group(name, members);
+                g.id = c.doc.next_id;
+                c.doc.next_id += 1;
+                let gid = g.id;
+                let at = match pos {
+                    Some(p) => (p + 1).saturating_sub(top_n).min(c.doc.layers.len()),
+                    None => c.doc.layers.len(),
+                };
+                c.doc.layers.insert(at, g);
+                Ok(json!({"layerId": gid}))
+            }
+            "doc.ungroup" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let i = c.doc.index_of(id).context("layer not found")?;
+                let l = c.doc.layers.remove(i);
+                let children = match l.kind {
+                    LayerKind::Group { children } => children,
+                    _ => anyhow::bail!("layer {id} is not a group"),
+                };
+                for (k, mut child) in children.into_iter().enumerate() {
+                    child.x += l.x;
+                    child.y += l.y;
+                    // fresh ids so the compositor cache can't collide
+                    child.id = c.doc.next_id;
+                    c.doc.next_id += 1;
+                    child.gen += 1;
+                    c.doc.layers.insert(i + k, child);
+                }
+                Ok(json!("ok"))
             }
             "doc.maskPaint" => {
                 let c = self.composer.as_mut().context("no document")?;
@@ -739,18 +880,54 @@ fn recipe_arg(v: &Value) -> Result<Recipe> {
 }
 
 fn write_image(img: &koubou_core::develop::RgbaImage, out: Option<&str>) -> Result<Value> {
-    // encode straight from the pixel buffer — no intermediate image clone
-    use image::codecs::png::PngEncoder;
+    write_image_fmt(img, out, "png", 90)
+}
+
+/// encode a rendered image. format: "png" (default, alpha-capable, also the
+/// b64 return format), "jpeg"/"jpg" (file only; alpha composited over the
+/// backdrop colour — JPEG has no alpha), "tiff" (file only, rgba8).
+fn write_image_fmt(
+    img: &koubou_core::develop::RgbaImage,
+    out: Option<&str>,
+    format: &str,
+    quality: u8,
+) -> Result<Value> {
     use image::ImageEncoder as _;
+    let fmt = format.to_ascii_lowercase();
     let encode = |w: &mut dyn std::io::Write| -> Result<()> {
-        PngEncoder::new(w)
-            .write_image(
-                &img.data,
-                img.width,
-                img.height,
-                image::ExtendedColorType::Rgba8,
-            )
-            .map_err(Into::into)
+        match fmt.as_str() {
+            "jpeg" | "jpg" => {
+                // flatten onto opaque — JPEG stores no alpha; the pixels are
+                // already composited over the document backdrop
+                let rgb: Vec<u8> = img
+                    .data
+                    .chunks_exact(4)
+                    .flat_map(|p| [p[0], p[1], p[2]])
+                    .collect();
+                image::codecs::jpeg::JpegEncoder::new_with_quality(w, quality)
+                    .write_image(&rgb, img.width, img.height, image::ExtendedColorType::Rgb8)
+                    .map_err(Into::into)
+            }
+            "tiff" | "tif" => {
+                // TiffEncoder wants Write+Seek — buffer through a Cursor
+                let mut buf = std::io::Cursor::new(Vec::new());
+                image::codecs::tiff::TiffEncoder::new(&mut buf).write_image(
+                    &img.data,
+                    img.width,
+                    img.height,
+                    image::ExtendedColorType::Rgba8,
+                )?;
+                w.write_all(&buf.into_inner()).map_err(Into::into)
+            }
+            _ => image::codecs::png::PngEncoder::new(w)
+                .write_image(
+                    &img.data,
+                    img.width,
+                    img.height,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(Into::into),
+        }
     };
     match out {
         Some(path) => {
@@ -915,6 +1092,9 @@ fn layer_from(v: &Value) -> Result<Layer> {
     if let Some(b) = v.get("blend").and_then(Value::as_str) {
         l.blend = BlendMode::parse(b).unwrap_or(BlendMode::Normal);
     }
+    if let Some(s) = v.get("styles") {
+        l.styles = serde_json::from_value(s.clone()).context("styles")?;
+    }
     Ok(l)
 }
 
@@ -954,6 +1134,13 @@ fn set_layer(doc: &mut Document, id: u64, v: &Value) -> Result<Value> {
     }
     if v.get("mask").is_some_and(|m| m.is_null()) {
         l.mask = None;
+    }
+    if v.get("styles").is_some_and(|s| s.is_null()) {
+        l.styles = Default::default();
+        l.gen += 1;
+    } else if let Some(s) = v.get("styles") {
+        l.styles = serde_json::from_value(s.clone()).context("styles")?;
+        l.gen += 1;
     }
     if let Some(r) = v.get("recipe") {
         let recipe = if r.is_string() {
@@ -1262,7 +1449,7 @@ mod tests {
             .iter()
             .filter_map(|s| s.get("id").and_then(Value::as_str))
             .collect();
-        for id in ids {
+        for id in &ids {
             assert!(spec_ids.contains(id), "command '{id}' has no spec");
         }
         for sid in &spec_ids {
@@ -1398,6 +1585,303 @@ mod tests {
         assert_eq!(
             p["result"]["pages"][0]["frames"].as_array().unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn pick_bounds_maskrect() {
+        let mut s = s();
+        s.dispatch(&d(
+            &json!({"id": "doc.new", "name": "t", "w": 100, "h": 100}),
+        ));
+        // opaque red raster 20×20 at (10, 10)
+        let px: Vec<u8> = (0..20 * 20 * 4)
+            .map(|i| if i % 4 == 3 { 255 } else { 200 })
+            .collect();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.addLayer", "kind": "raster", "name": "sq",
+            "w": 20, "h": 20, "rgbaB64": b64, "x": 10, "y": 10,
+        })));
+        assert_eq!(r["ok"], true, "addLayer: {r}");
+        let lid = r["result"]["layerId"].as_u64().unwrap();
+
+        let r = s.dispatch(&d(&json!({"id": "doc.pick", "x": 15, "y": 15})));
+        assert_eq!(r["result"]["layer"], json!(lid));
+        let r = s.dispatch(&d(&json!({"id": "doc.pick", "x": 50, "y": 50})));
+        assert_eq!(r["result"]["layer"], Value::Null);
+
+        let r = s.dispatch(&d(&json!({"id": "doc.bounds", "layer": lid})));
+        assert_eq!(r["result"]["bounds"], json!([10.0, 10.0, 20.0, 20.0]));
+        let r = s.dispatch(&d(&json!({"id": "doc.bounds"})));
+        assert_eq!(r["result"].as_array().unwrap().len(), 1);
+
+        // rect mask cutting the layer in half (mask coords are layer-pixel
+        // space like maskPaint): layer covers x 0..10 → doc 10..20 picks,
+        // doc 20..30 does not
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.maskRect", "layer": lid, "x": 0, "y": 0, "w": 10, "h": 20
+        })));
+        assert_eq!(r["ok"], true, "maskRect: {r}");
+        let r = s.dispatch(&d(&json!({"id": "doc.pick", "x": 15, "y": 15})));
+        assert_eq!(r["result"]["layer"], json!(lid));
+        let r = s.dispatch(&d(&json!({"id": "doc.pick", "x": 25, "y": 15})));
+        assert_eq!(r["result"]["layer"], Value::Null);
+    }
+
+    #[test]
+    fn group_ungroup() {
+        let mut s = s();
+        new_doc(&mut s);
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "a", "color": [1,0,0,1]}),
+        ));
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "b", "color": [0,1,0,1]}),
+        ));
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let ids: Vec<u64> = doc["result"]["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["id"].as_u64().unwrap())
+            .collect();
+
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.group", "layers": ids, "name": "g1"
+        })));
+        assert_eq!(r["ok"], true, "group: {r}");
+        let gid = r["result"]["layerId"].as_u64().unwrap();
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let layers = doc["result"]["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0]["type"], "group");
+        assert_eq!(
+            layers[0]["children"].as_array().unwrap().len(),
+            2,
+            "group holds both members"
+        );
+
+        // nested children are addressable — setLayer works inside the group
+        let child = layers[0]["children"][0]["id"].as_u64().unwrap();
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.setLayer", "layer": child, "opacity": 0.5}),
+        ));
+        assert_eq!(r["ok"], true, "setLayer on child: {r}");
+
+        let r = s.dispatch(&d(&json!({"id": "doc.ungroup", "layer": gid})));
+        assert_eq!(r["ok"], true, "ungroup: {r}");
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["layers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn move_layer_reparents() {
+        let mut s = s();
+        new_doc(&mut s);
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "a", "color": [1,0,0,1]}),
+        ));
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "b", "color": [0,1,0,1]}),
+        ));
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "c", "color": [0,0,1,1]}),
+        ));
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let ids: Vec<u64> = doc["result"]["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["id"].as_u64().unwrap())
+            .collect();
+        let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+        // group a+b, then reparent c into it and back out
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.group", "layers": [a, b], "name": "g"
+        })));
+        assert_eq!(r["ok"], true, "group: {r}");
+        let gid = r["result"]["layerId"].as_u64().unwrap();
+
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.moveLayer", "layer": c, "parent": gid, "to": 0
+        })));
+        assert_eq!(r["ok"], true, "moveLayer into group: {r}");
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let layers = doc["result"]["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0]["children"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            layers[0]["children"][0]["id"].as_u64().unwrap(),
+            c,
+            "c lands at index 0 inside the group"
+        );
+
+        // moving the group into its own member is a cycle — refused,
+        // tree untouched
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.moveLayer", "layer": gid, "parent": gid, "to": 0
+        })));
+        assert_eq!(r["ok"], false);
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.moveLayer", "layer": gid, "parent": c, "to": 0
+        })));
+        assert_eq!(r["ok"], false, "non-group parent must fail");
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["layers"].as_array().unwrap().len(), 1);
+
+        // move c back out to top level below the group
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.moveLayer", "layer": c, "to": 0
+        })));
+        assert_eq!(r["ok"], true, "moveLayer to top level: {r}");
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let layers = doc["result"]["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0]["id"].as_u64().unwrap(), c);
+        assert_eq!(layers[1]["children"].as_array().unwrap().len(), 2);
+
+        // bad layer / bad parent ids error, don't panic, don't lose layers
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.moveLayer", "layer": 9999, "to": 0
+        })));
+        assert_eq!(r["ok"], false);
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.moveLayer", "layer": c, "parent": 9999, "to": 0
+        })));
+        assert_eq!(r["ok"], false);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(
+            doc["result"]["layers"].as_array().unwrap().len()
+                + doc["result"]["layers"][1]["children"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+            4,
+            "every layer still present after failed moves"
+        );
+    }
+
+    #[test]
+    fn drop_shadow_renders() {
+        let mut s = s();
+        s.dispatch(&d(&json!({"id": "doc.new", "name": "t", "w": 64, "h": 64})));
+        let px: Vec<u8> = (0..16 * 16 * 4)
+            .map(|i| if i % 4 == 3 { 255 } else { 255 })
+            .collect();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
+        let r = s.dispatch(&d(&json!({
+            "id": "doc.addLayer", "kind": "raster", "name": "sq",
+            "w": 16, "h": 16, "rgbaB64": b64, "x": 20, "y": 20,
+            "styles": {"dropShadow": {"dx": 8.0, "dy": 8.0, "blur": 2.0,
+                "color": [1.0, 0.0, 0.0, 1.0], "spread": 0.0}}
+        })));
+        assert_eq!(r["ok"], true, "addLayer: {r}");
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.render", "out": "/tmp/kb_shadow.png"}),
+        ));
+        assert_eq!(r["ok"], true, "render: {r}");
+        // shadow covers 28..43 (offset 8 + 16px); (42,42) is inside it and
+        // outside the white square (20..35) → red shadow tint
+        let img = image::open("/tmp/kb_shadow.png").unwrap().to_rgba8();
+        let p = img.get_pixel(42, 42);
+        assert!(
+            p[0] > 40 && p[3] > 0,
+            "shadow should tint the canvas: {p:?}"
+        );
+    }
+
+    #[test]
+    fn flatten_no_double_backdrop() {
+        let mut s = s();
+        s.dispatch(&d(&json!({"id": "doc.new", "name": "t", "w": 32, "h": 32})));
+        s.dispatch(&d(
+            &json!({"id": "doc.setBackdrop", "color": [1.0, 0.0, 0.0, 1.0]}),
+        ));
+        // semi-transparent white — over red backdrop = pink
+        let px: Vec<u8> = (0..8 * 8 * 4)
+            .map(|i| match i % 4 {
+                3 => 128,
+                _ => 255,
+            })
+            .collect();
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&px);
+        s.dispatch(&d(&json!({
+            "id": "doc.addLayer", "kind": "raster", "name": "sq",
+            "w": 8, "h": 8, "rgbaB64": b64, "x": 0, "y": 0,
+        })));
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.render", "out": "/tmp/kb_before.png"}),
+        ));
+        assert_eq!(r["ok"], true);
+        let before = image::open("/tmp/kb_before.png").unwrap().to_rgba8();
+        let before_px = *before.get_pixel(4, 4);
+
+        let r = s.dispatch(&d(&json!({"id": "doc.flatten"})));
+        assert_eq!(r["ok"], true, "flatten: {r}");
+        let r = s.dispatch(&d(&json!({"id": "doc.render", "out": "/tmp/kb_after.png"})));
+        assert_eq!(r["ok"], true);
+        let after = image::open("/tmp/kb_after.png").unwrap().to_rgba8();
+        let after_px = *after.get_pixel(4, 4);
+        for c in 0..4 {
+            let d = (before_px[c] as i32 - after_px[c] as i32).abs();
+            assert!(
+                d <= 2,
+                "flatten changed pixel: {before_px:?} vs {after_px:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_formats_and_psd() {
+        let mut s = s();
+        s.dispatch(&d(&json!({"id": "doc.new", "name": "t", "w": 16, "h": 16})));
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "bg", "color": [0.2,0.4,0.6,1.0]}),
+        ));
+        for (fmt, path) in [
+            ("jpeg", "/tmp/kb_f.jpg"),
+            ("tiff", "/tmp/kb_f.tiff"),
+            ("png", "/tmp/kb_f.png"),
+        ] {
+            let r = s.dispatch(&d(&json!({"id": "doc.render", "out": path, "format": fmt})));
+            assert_eq!(r["ok"], true, "render {fmt}: {r}");
+            assert!(std::path::Path::new(path).exists());
+        }
+        let r = s.dispatch(&d(&json!({"id": "doc.exportPsd", "path": "/tmp/kb_f.psd"})));
+        assert_eq!(r["ok"], true, "exportPsd: {r}");
+        let head = std::fs::read("/tmp/kb_f.psd").unwrap();
+        assert_eq!(&head[..4], b"8BPS");
+        // and it round-trips through our own importer
+        let r = s.dispatch(&d(&json!({"id": "doc.importPsd", "path": "/tmp/kb_f.psd"})));
+        assert_eq!(r["ok"], true, "import exported psd: {r}");
+    }
+
+    #[test]
+    fn batch_restores_redo_on_failure() {
+        let mut s = s();
+        new_doc(&mut s);
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "a", "color": [1,0,0,1]}),
+        ));
+        s.dispatch(&d(&json!({"id": "doc.undo"}))); // redo stack now holds the addLayer
+        let r = s.dispatch(&d(&json!({
+            "id": "batch",
+            "commands": [
+                {"id": "doc.addLayer", "kind": "fill", "name": "b", "color": [0,1,0,1]},
+                {"id": "doc.nonsense"}
+            ]
+        })));
+        assert_eq!(r["ok"], false);
+        // the successful sub-command cleared redo, but rollback must restore it
+        let r = s.dispatch(&d(&json!({"id": "doc.redo"})));
+        assert_eq!(
+            r["result"]["changed"], true,
+            "redo must survive failed atomic batch"
         );
     }
 }

@@ -49,7 +49,7 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 
 | feature | status | command / note |
 |---|---|---|
-| Layer stack (add/remove/reorder/select/duplicate) | ✅ | `cmd:doc.addLayer`, `doc.removeLayer`, `doc.reorder`, `doc.setLayer`, `doc.duplicateLayer` |
+| Layer stack (add/remove/reorder/select/duplicate/reparent) | ✅ | `cmd:doc.addLayer`, `doc.removeLayer`, `doc.reorder`, `doc.moveLayer`, `doc.setLayer`, `doc.duplicateLayer` + panel drag/drop |
 | Opacity + visibility | ✅ | `doc.setLayer` |
 | Blend modes — 27 per PDF/W3C | ✅ | `BlendMode`; `Dissolve` falls back to normal (🟡) |
 | Layer masks (paint, density, feather, invert) | ✅ | `cmd:doc.maskPaint`, `doc.maskInvert` + `Layer.mask` |
@@ -59,18 +59,19 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | Shape layers (SVG path, fill+stroke, dash) | ✅ | `doc.addLayer kind=shape` |
 | Shape generators (rect/roundRect/ellipse/star/line) + edit/remove | ✅ | `cmd:doc.addShape`, `doc.shapeSet`, `doc.shapeRemove` |
 | Text layers (font, size, tracking, leading, align, wrap) | ✅ | `doc.addLayer kind=text` |
-| Group layers (isolated composite) | 🟡 | engine ✅; UI nesting ❌ |
+| Group layers (isolated composite) | ✅ | `cmd:doc.group`, `doc.ungroup` + UI nesting (disclosure rows, ⌘-click multi-select, drag into/out of groups) |
 | Raster layers (embedded PNG / file link) | ✅ | `doc.addLayer kind=raster/rasterFile` |
 | Document model (.koubou JSON), open/save | ✅ | `doc.new`, `doc.open`, `doc.save`, `doc.json`, `doc.fromPhoto` |
-| Full-res export + preview render | ✅ | `doc.render` (PNG only — JPEG/TIFF ❌), `doc.exportLayer` |
+| Full-res export + preview render | ✅ | `cmd:doc.render` (PNG/JPEG/TIFF, `format`+`quality` params), `doc.exportLayer` |
 | PSD import (layers, blend modes, masks→flattened) | ✅ | `doc.importPsd` / `koubou-cli psd` |
-| PSD export | ❌ | — |
+| PSD export | 🟡 | `cmd:doc.exportPsd` — flattened composite, no layer preservation |
 | Canvas: pan/zoom | 🟡 | fit-to-view only |
-| Canvas: drag-move, transform handles, marquee | ❌ | numeric x/y/scale via inspector |
-| On-canvas text editing | ❌ | inspector text field only |
+| Canvas: drag-move, transform handles, marquee | ✅ | `cmd:doc.pick`, `doc.bounds` + canvas gestures (alpha-precise pick, corner scale handles, marquee → selectedSet) |
+| On-canvas text editing | ✅ | double-click a text layer → in-place editor (Esc commits) |
 | Undo/redo (all domains, ⌘Z in-app) | ✅ | `cmd:doc.undo`, `doc.redo`, `tl.undo`, `tl.redo`, `pg.undo`, `pg.redo` — snapshot stacks, cap 32 |
 | Merge down / flatten / canvas resize+crop | ✅ | `doc.mergeDown`, `doc.flatten`, `doc.resize`, `doc.crop`, `doc.setBackdrop` |
-| Layer styles (shadow, glow, stroke, bevel) | ❌ | — |
+| Layer styles | 🟡 | drop shadow via `doc.setLayer styles={dropShadow}` (dx,dy,blur,spread,color) — glow/stroke/bevel ❌ |
+| Mask shortcuts (rect fill, feather) | ✅ | `cmd:doc.maskRect` (layer-space, feather param) |
 | Smart objects / linked docs | ❌ | — |
 | Channels palette, alpha ops | ❌ | — |
 | Filter gallery / liquify / warp | ❌ | — |
@@ -92,12 +93,11 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 
 ## Top gaps (ordered by user impact)
 
-1. Canvas manipulation (drag-move, on-canvas text, marquee)
-2. Inspector coverage for the full recipe (curves/wheels/qualifier)
-4. JPEG/TIFF export from documents
-5. Mask UX (thumbnail, gradient tool, mask view)
-6. Group nesting in the UI
-7. PSD export
+1. Mask UX (thumbnail, gradient tool, mask view)
+2. Layered PSD export (composite-only today)
+3. Layer styles beyond drop shadow (glow, stroke, bevel)
+4. Canvas pan/zoom (fit-to-view only)
+5. Boolean vector ops / node editing
 
 ## Vector / design (vectorcraft)
 
@@ -115,25 +115,29 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | Timeline model (.kmotion): tracks, clips, cues | ✅ | `cmd:tl.new`, `tl.open`, `tl.save`, `tl.json`, `tl.addTrack` |
 | Clip edit (in/out/offset, keyframed opacity/scale/x/y, fades) | ✅ | `tl.addClip`, `tl.setClip`, `tl.removeClip`, `tl.splitClip`, `tl.duplicateClip` |
 | Track edit (name/mute/remove) | ✅ | `tl.setTrack`, `tl.removeTrack` |
-| Subtitles (cues) + SRT burn-in | ✅ | `tl.addCue`, `tl.setCue`, `tl.removeCue` |
+| Subtitles (cues) + SRT burn-in, CJK glyphs | ✅ | `tl.addCue`, `tl.setCue`, `tl.removeCue` — fontdb CJK fallback |
 | Frame preview + mp4 export via ffmpeg | ✅ | `tl.renderFrame`, `tl.render` |
 | Silence detection, media probe | ✅ | `tl.detectSilence`, `tl.probe` |
 | Generative clip insert (minimax-h3 endpoint) | ✅ | `tl.generateClip` |
 | Speech-to-subtitle (Speech framework) | ✅ | app (SFSpeechRecognizer → `tl.addCue`) |
-| Audio ducking/EQ/comp per clip | 🟡 | ffmpeg af params; no UI yet |
-| Transitions beyond fade, speed ramp, multicam | ❌ | — |
+| Audio: per-clip volume keyframes + auto-duck under cues | ✅ | `tl.setClip volume`, `cmd:tl.duck` |
+| Transitions (slide/wipe/dip per clip edge) | 🟡 | `tl.setClip transIn/transOut` — no speed ramp/multicam |
+| EQ/comp per clip | 🟡 | ffmpeg af params |
 | GPU realtime playback | ❌ | frame-by-frame only |
 
 ## Pages / layout (designcraft)
 
 | feature | status | command / note |
 |---|---|---|
-| Multi-page doc (.kpages), masters | ✅ | `cmd:pg.new`, `pg.open`, `pg.save`, `pg.addPage`, `pg.duplicatePage`, `pg.addMaster`, `pg.setMaster` |
+| Multi-page doc (.kpages), masters, page size | ✅ | `cmd:pg.new`, `pg.open`, `pg.save`, `pg.addPage`, `pg.duplicatePage`, `pg.addMaster`, `pg.setMaster`, `pg.setPageSize` |
 | Frames: text/image/rect/line, rotation, move across pages | ✅ | `pg.addFrame`, `pg.setFrame`, `pg.removeFrame`, `pg.moveFrame` |
+| Threaded text frames (flow across frames/pages) | ✅ | `cmd:pg.linkFrames` |
+| Facing-page spreads | ✅ | `cmd:pg.setSpread` |
+| Paragraph styles (define/apply) | 🟡 | `cmd:pg.setStyle`, `pg.applyStyle` — no hyphenation |
 | PDF export (PDF 1.4, Helvetica+JPEG+vectors) | ✅ | `pg.render` |
+| PDF CJK text | ✅ | non-WinAnsi runs rasterise+embed w/ /SMask |
 | Page PNG preview | ✅ | `pg.renderPng` |
-| Text flow/threading, facing pages, bleed | ❌ | — |
-| Character/paragraph styles, hyphenation | ❌ | — |
+| Bleed, hyphenation | ❌ | — |
 
 ## Print / PDF (printcraft)
 

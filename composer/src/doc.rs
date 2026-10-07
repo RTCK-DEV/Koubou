@@ -106,21 +106,61 @@ impl Document {
     }
 
     pub fn layer(&self, id: u64) -> Option<&Layer> {
-        self.layers.iter().find(|l| l.id == id)
+        fn find<'a>(layers: &'a [Layer], id: u64) -> Option<&'a Layer> {
+            for l in layers {
+                if l.id == id {
+                    return Some(l);
+                }
+                if let LayerKind::Group { children } = &l.kind {
+                    if let Some(f) = find(children, id) {
+                        return Some(f);
+                    }
+                }
+            }
+            None
+        }
+        find(&self.layers, id)
     }
 
     pub fn layer_mut(&mut self, id: u64) -> Option<&mut Layer> {
-        self.layers.iter_mut().find(|l| l.id == id)
+        fn find<'a>(layers: &'a mut [Layer], id: u64) -> Option<&'a mut Layer> {
+            for l in layers.iter_mut() {
+                if l.id == id {
+                    return Some(l);
+                }
+                if let LayerKind::Group { children } = &mut l.kind {
+                    if let Some(f) = find(children, id) {
+                        return Some(f);
+                    }
+                }
+            }
+            None
+        }
+        find(&mut self.layers, id)
     }
 
-    /// index of a layer (0 = bottom). usize::MAX when absent.
+    /// top-level stack index of a layer (0 = bottom); nested children and
+    /// absent ids return None — stack ops are top-level only.
     pub fn index_of(&self, id: u64) -> Option<usize> {
         self.layers.iter().position(|l| l.id == id)
     }
 
+    /// remove a layer anywhere in the tree (top level or inside a group)
     pub fn remove_layer(&mut self, id: u64) -> Option<Layer> {
-        let i = self.index_of(id)?;
-        Some(self.layers.remove(i))
+        fn remove_in(layers: &mut Vec<Layer>, id: u64) -> Option<Layer> {
+            if let Some(i) = layers.iter().position(|l| l.id == id) {
+                return Some(layers.remove(i));
+            }
+            for l in layers.iter_mut() {
+                if let LayerKind::Group { children } = &mut l.kind {
+                    if let Some(r) = remove_in(children, id) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+        remove_in(&mut self.layers, id)
     }
 
     /// move layer to a new stack index (0 = bottom)
@@ -132,6 +172,60 @@ impl Document {
         let to = to.min(self.layers.len());
         self.layers.insert(to, l);
         true
+    }
+
+    /// is `needle` the layer `hay` itself or one of its descendants?
+    /// (a group can never be moved inside its own subtree)
+    fn is_self_or_descendant(hay: &Layer, needle: u64) -> bool {
+        if hay.id == needle {
+            return true;
+        }
+        match &hay.kind {
+            LayerKind::Group { children } => children
+                .iter()
+                .any(|c| Self::is_self_or_descendant(c, needle)),
+            _ => false,
+        }
+    }
+
+    /// move a layer to (parent group, index). `parent` None = top level.
+    /// Refuses cycles (a group into itself/descendants), missing layers and
+    /// non-group parents — the tree is untouched on failure.
+    pub fn move_layer(&mut self, id: u64, parent: Option<u64>, to: usize) -> bool {
+        let Some(l) = self.layer(id) else {
+            return false;
+        };
+        if let Some(pid) = parent {
+            // parent must exist, be a group, and not sit inside the moved layer
+            match self.layer(pid) {
+                Some(p) if matches!(p.kind, LayerKind::Group { .. }) => {}
+                _ => return false,
+            }
+            if Self::is_self_or_descendant(l, pid) {
+                return false;
+            }
+        }
+        let Some(l) = self.remove_layer(id) else {
+            return false;
+        };
+        match parent {
+            None => {
+                self.layers.insert(to.min(self.layers.len()), l);
+                true
+            }
+            Some(pid) => match self.layer_mut(pid).map(|p| &mut p.kind) {
+                Some(LayerKind::Group { children }) => {
+                    children.insert(to.min(children.len()), l);
+                    true
+                }
+                // unreachable after the checks above, but never drop a
+                // layer from the document on a failed move
+                _ => {
+                    self.layers.push(l);
+                    false
+                }
+            },
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -178,8 +272,42 @@ pub struct Layer {
     /// content generation — bumped on every content edit for cache invalidation
     #[serde(default)]
     pub gen: u64,
+    /// layer styles (drop shadow etc.) rendered beneath this layer
+    #[serde(default)]
+    pub styles: LayerStyles,
     #[serde(flatten)]
     pub kind: LayerKind,
+}
+
+/// Photoshop-style layer effects; all absent/default = no styling.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerStyles {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_shadow: Option<DropShadow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropShadow {
+    /// offset in document pixels
+    #[serde(default)]
+    pub dx: f32,
+    #[serde(default)]
+    pub dy: f32,
+    /// blur radius in px
+    #[serde(default)]
+    pub blur: f32,
+    /// [r,g,b,a] 0..1 sRGB
+    #[serde(default = "default_shadow_color")]
+    pub color: [f32; 4],
+    /// spread: expands the silhouette before blurring, 0..1
+    #[serde(default)]
+    pub spread: f32,
+}
+
+fn default_shadow_color() -> [f32; 4] {
+    [0.0, 0.0, 0.0, 0.5]
 }
 
 fn one_f() -> f32 {
@@ -199,6 +327,7 @@ impl Layer {
             scale: 1.0,
             mask: None,
             gen: 0,
+            styles: LayerStyles::default(),
             kind,
         }
     }

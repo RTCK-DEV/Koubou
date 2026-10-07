@@ -104,6 +104,9 @@ pub struct Composer {
     engine: Engine,
     /// layer id -> (gen, pixels). Invalidated when the layer's gen differs.
     cache: HashMap<u64, (u64, LayerPixels)>,
+    /// last rendered doc-space canvas + the render key it was produced for —
+    /// identical renders are returned without re-blending the stack.
+    out_cache: Option<(u64, LayerPixels)>,
 }
 
 impl Composer {
@@ -112,20 +115,62 @@ impl Composer {
             doc,
             engine: Engine::new()?,
             cache: HashMap::new(),
+            out_cache: None,
         })
     }
 
-    /// doc-sized composite, rgba8
+    /// fingerprint of everything that affects the composite — layer stack
+    /// state, content gens, masks and styles. When it matches the last
+    /// render, the cached canvas is returned as-is.
+    fn render_key(&self) -> u64 {
+        fn fnv(h: u64, b: &[u8]) -> u64 {
+            b.iter()
+                .fold(h, |h, v| h.wrapping_mul(0x100000001b3) ^ (*v as u64))
+        }
+        fn key_layers(h: u64, layers: &[Layer]) -> u64 {
+            layers.iter().fold(h, |mut h, l| {
+                h = fnv(h, &l.id.to_le_bytes());
+                h = fnv(h, &l.gen.to_le_bytes());
+                h = fnv(h, &[l.visible as u8]);
+                h = fnv(h, &l.opacity.to_bits().to_le_bytes());
+                h = fnv(h, &[l.blend as u8]);
+                h = fnv(h, &l.x.to_le_bytes());
+                h = fnv(h, &l.y.to_le_bytes());
+                h = fnv(h, &l.scale.to_bits().to_le_bytes());
+                if let Some(m) = &l.mask {
+                    // masks are doc-sized; hash a checksum over the data so
+                    // dab-level edits register without an O(n) walk per pixel
+                    let mut sum = 0u64;
+                    for (i, v) in m.data.iter().enumerate() {
+                        sum = sum.wrapping_add((v.to_bits() as u64).wrapping_mul((i as u64) | 1));
+                    }
+                    h = fnv(h, &m.width.to_le_bytes());
+                    h = fnv(h, &m.height.to_le_bytes());
+                    h = fnv(h, &sum.to_le_bytes());
+                    h = fnv(h, &[m.inverted as u8]);
+                    h = fnv(h, &m.density.to_bits().to_le_bytes());
+                    h = fnv(h, &m.feather.to_bits().to_le_bytes());
+                }
+                if let Ok(sj) = serde_json::to_vec(&l.styles) {
+                    h = fnv(h, &sj);
+                }
+                if let LayerKind::Group { children } = &l.kind {
+                    key_layers(h, children)
+                } else {
+                    h
+                }
+            })
+        }
+        let mut h = 0xcbf29ce484222325u64;
+        h = fnv(h, &self.doc.width.to_le_bytes());
+        h = fnv(h, &self.doc.height.to_le_bytes());
+        h = key_layers(h, &self.doc.layers);
+        h
+    }
+
+    /// doc-sized composite with backdrop applied, rgba8
     pub fn render(&mut self) -> Result<RgbaImage> {
-        let w = self.doc.width;
-        let h = self.doc.height;
-        let mut canvas = LayerPixels::empty(w, h);
-        // move the layer vec out rather than cloning it — embedded rasters
-        // and masks are heavy and this list gets walked every render
-        let layers = std::mem::take(&mut self.doc.layers);
-        let r = self.composite_list(&mut canvas, &layers);
-        self.doc.layers = layers;
-        r?;
+        let mut canvas = self.render_raw()?;
         // backdrop under everything
         let bd = self.doc.backdrop;
         for p in canvas.data.iter_mut() {
@@ -138,10 +183,32 @@ impl Composer {
             }
         }
         Ok(RgbaImage {
-            width: w,
-            height: h,
+            width: self.doc.width,
+            height: self.doc.height,
             data: canvas.to_rgba8(),
         })
+    }
+
+    /// doc-sized composite WITHOUT the backdrop — straight-alpha stack.
+    /// Served from out_cache when the render key is unchanged.
+    pub fn render_raw(&mut self) -> Result<LayerPixels> {
+        let key = self.render_key();
+        if let Some((k, pix)) = &self.out_cache {
+            if *k == key {
+                return Ok(pix.clone());
+            }
+        }
+        let w = self.doc.width;
+        let h = self.doc.height;
+        let mut canvas = LayerPixels::empty(w, h);
+        // move the layer vec out rather than cloning it — embedded rasters
+        // and masks are heavy and this list gets walked every render
+        let layers = std::mem::take(&mut self.doc.layers);
+        let r = self.composite_list(&mut canvas, &layers);
+        self.doc.layers = layers;
+        r?;
+        self.out_cache = Some((key, canvas.clone()));
+        Ok(canvas)
     }
 
     /// rasterize one layer's own pixels (no blending) — for layer export
@@ -157,7 +224,10 @@ impl Composer {
 
     /// merge `id` with the layer below it into one raster layer; the new
     /// layer keeps the lower layer's name and takes both layers' place.
-    /// Returns the merged layer's id.
+    /// Backdrop-dependent blends (multiply etc.) bake against the real
+    /// composite below the pair — matching Photoshop's merge-down result —
+    /// while coverage outside the pair stays transparent so the layers
+    /// underneath still show through.
     pub fn merge_down(&mut self, id: u64) -> Result<u64> {
         let i = self
             .doc
@@ -168,8 +238,20 @@ impl Composer {
         }
         let below_name = self.doc.layers[i - 1].name.clone();
         let pair = self.doc.layers[i - 1..=i].to_vec();
+        let below = self.doc.layers[..i - 1].to_vec();
+        // pair alpha coverage, rendered in isolation
+        let mut cov = LayerPixels::empty(self.doc.width, self.doc.height);
+        self.composite_list(&mut cov, &pair)?;
+        // pair composited over the real backdrop of everything below it
         let mut buf = LayerPixels::empty(self.doc.width, self.doc.height);
+        self.composite_list(&mut buf, &below)?;
         self.composite_list(&mut buf, &pair)?;
+        // merged pixel = buf rgb where the pair covered anything; alpha is
+        // the pair's own coverage (the backdrop rgb is baked in for blended
+        // areas, like PS does)
+        for k in 0..buf.data.len() {
+            buf.data[k][3] = cov.data[k][3];
+        }
         let (pix, x, y) = match buf.opaque_bbox() {
             Some((x0, y0, x1, y1)) => (buf.crop(x0, y0, x1 - x0, y1 - y0), x0 as i32, y0 as i32),
             None => (buf.crop(0, 0, 1, 1), 0, 0),
@@ -186,15 +268,18 @@ impl Composer {
         Ok(new_id)
     }
 
-    /// bake the whole composite into a single raster layer named `name`
+    /// bake the layer stack into a single raster layer named `name`.
+    /// The backdrop is NOT baked in — it stays a document setting so the
+    /// flattened composite is pixel-identical to what was on screen.
     pub fn flatten(&mut self, name: &str) -> Result<u64> {
-        let img = self.render()?;
-        let mut l = Layer::raster(name, img.width, img.height, img.data);
+        let img = self.render_raw()?;
+        let mut l = Layer::raster(name, img.w, img.h, img.to_rgba8());
         l.id = self.doc.next_id;
         self.doc.next_id += 1;
         let id = l.id;
         self.doc.layers = vec![l];
         self.cache.clear();
+        self.out_cache = None;
         Ok(id)
     }
 
@@ -232,15 +317,69 @@ impl Composer {
                 LayerKind::Group { children } => {
                     let mut gbuf = LayerPixels::empty(canvas.w, canvas.h);
                     self.composite_list(&mut gbuf, children)?;
+                    self.draw_shadow(canvas, &gbuf, layer);
                     self.blend_layer(canvas, &gbuf, layer);
                 }
                 _ => {
                     let pix = self.rasterize_layer(layer)?;
+                    self.draw_shadow(canvas, &pix, layer);
                     self.blend_layer(canvas, &pix, layer);
                 }
             }
         }
         Ok(())
+    }
+
+    /// layer styles: drop shadow = the layer's own alpha silhouette, filled
+    /// with the shadow colour, blurred and offset, composited beneath the
+    /// layer (above everything below it) with a normal src-over blend.
+    fn draw_shadow(&self, canvas: &mut LayerPixels, pix: &LayerPixels, layer: &Layer) {
+        let Some(sh) = layer.styles.drop_shadow.as_ref() else {
+            return;
+        };
+        if sh.color[3] <= 0.0 {
+            return;
+        }
+        // silhouette at layer scale — shadow offset scales with the layer,
+        // like Photoshop
+        let scale = layer.scale.max(1e-4);
+        let sw = ((pix.w as f32 * scale).ceil() as u32).max(1);
+        let sh_px = ((pix.h as f32 * scale).ceil() as u32).max(1);
+        let mut alpha = vec![0.0f32; (sw * sh_px) as usize];
+        for dy in 0..sh_px {
+            for dx in 0..sw {
+                let sx = (dx as f32 / scale).min(pix.w.saturating_sub(1) as f32);
+                let sy = (dy as f32 / scale).min(pix.h.saturating_sub(1) as f32);
+                alpha[(dy * sw + dx) as usize] =
+                    pix.data[(sy.floor() as u32 * pix.w + sx.floor() as u32) as usize][3];
+            }
+        }
+        // spread: threshold-widen the silhouette before the blur
+        if sh.spread > 0.0 {
+            let grow = (sh.blur.max(1.0) * sh.spread.clamp(0.0, 1.0)).round() as usize;
+            if grow > 0 {
+                dilate(&mut alpha, sw, sh_px, grow);
+            }
+        }
+        let r = sh.blur.max(0.0).round() as usize;
+        if r > 0 {
+            box_blur(&mut alpha, sw, sh_px, r, 3);
+        }
+        let mut shadow = LayerPixels::empty(sw, sh_px);
+        for (i, a) in alpha.iter().enumerate() {
+            let a = (*a * sh.color[3]).clamp(0.0, 1.0);
+            if a > 0.0 {
+                shadow.data[i] = [sh.color[0], sh.color[1], sh.color[2], a];
+            }
+        }
+        // reuse blend_layer with a synthetic placement layer (normal blend,
+        // full opacity, no mask/styles)
+        let mut sl = Layer::raster("shadow", sw, sh_px, Vec::new());
+        sl.x = layer.x + sh.dx.round() as i32;
+        sl.y = layer.y + sh.dy.round() as i32;
+        sl.scale = 1.0;
+        sl.opacity = layer.opacity;
+        self.blend_layer(canvas, &shadow, &sl);
     }
 
     /// the develop pipeline applied to an in-memory composite (raster input)
@@ -271,6 +410,99 @@ impl Composer {
         };
         let out = develop::develop_cpu(&d, &r, 0);
         Ok(LayerPixels::from_rgba8(out.width, out.height, &out.data))
+    }
+
+    /// placed bounds of a layer in document coords [x, y, w, h].
+    /// Group/adjustment/develop layers cover their placement at doc scale;
+    /// the pixel bounds come from the compositor's own raster cache.
+    pub fn layer_bounds(&mut self, id: u64) -> Result<[f32; 4]> {
+        let layer = self
+            .doc
+            .layer(id)
+            .with_context(|| format!("layer {id} not found"))?
+            .clone();
+        let (w, h) = self.placed_size(&layer)?;
+        Ok([layer.x as f32, layer.y as f32, w, h])
+    }
+
+    /// placed bounds for every top-level layer, bottom→top order
+    pub fn all_bounds(&mut self) -> Vec<(u64, [f32; 4])> {
+        let ids: Vec<u64> = self.doc.layers.iter().map(|l| l.id).collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Ok(b) = self.layer_bounds(id) {
+                out.push((id, b));
+            }
+        }
+        out
+    }
+
+    /// placed (scaled) size of a layer; doc-sized for content kinds that
+    /// rasterize in document space
+    fn placed_size(&mut self, layer: &Layer) -> Result<(f32, f32)> {
+        let s = layer.scale.max(1e-4);
+        let (w, h) = match &layer.kind {
+            LayerKind::Raster { width, height, .. } => (*width as f32, *height as f32),
+            LayerKind::Text { text } => {
+                let (_, tw, th) = crate::text::rasterize(text)?;
+                (tw as f32, th as f32)
+            }
+            _ => (self.doc.width as f32, self.doc.height as f32),
+        };
+        Ok((w * s, h * s))
+    }
+
+    /// topmost layer whose placed, masked pixel at doc point (x, y) has
+    /// alpha > 0. Adjustment layers are skipped — they cover the whole
+    /// canvas and would swallow every pick.
+    pub fn pick(&mut self, x: f32, y: f32) -> Result<Option<u64>> {
+        let layers = self.doc.layers.clone();
+        for layer in layers.iter().rev() {
+            if !layer.visible || matches!(layer.kind, LayerKind::Adjustment { .. }) {
+                continue;
+            }
+            if let LayerKind::Group { children } = &layer.kind {
+                // hit-test the group's rendered buffer
+                let mut gbuf = LayerPixels::empty(self.doc.width, self.doc.height);
+                self.composite_list(&mut gbuf, children)?;
+                let ix = (x - layer.x as f32).floor() as i64;
+                let iy = (y - layer.y as f32).floor() as i64;
+                if ix >= 0 && iy >= 0 && ix < gbuf.w as i64 && iy < gbuf.h as i64 {
+                    if gbuf.data[(iy as u32 * gbuf.w + ix as u32) as usize][3] > 0.0 {
+                        return Ok(Some(layer.id));
+                    }
+                }
+                continue;
+            }
+            let pix = self.rasterize_layer(layer)?;
+            let s = layer.scale.max(1e-4);
+            let lx = (x - layer.x as f32) / s;
+            let ly = (y - layer.y as f32) / s;
+            if lx < 0.0 || ly < 0.0 || lx >= pix.w as f32 || ly >= pix.h as f32 {
+                continue;
+            }
+            let sx = lx.floor() as u32;
+            let sy = ly.floor() as u32;
+            let mut a = pix.data[(sy * pix.w + sx) as usize][3];
+            if a <= 0.0 {
+                continue;
+            }
+            if let Some(m) = &layer.mask {
+                let m = if m.feather > 0.0 {
+                    blur_mask(m)
+                } else {
+                    m.clone()
+                };
+                a *= m.at(
+                    sx.min(m.width.saturating_sub(1)),
+                    sy.min(m.height.saturating_sub(1)),
+                );
+            }
+            if a * layer.opacity.clamp(0.0, 1.0) > 0.0 {
+                return Ok(Some(layer.id));
+            }
+        }
+        Ok(None)
     }
 
     /// rasterize a layer's content into layer pixel space (cached)
@@ -334,6 +566,10 @@ impl Composer {
         let y0 = layer.y as i64;
         let cw = canvas.w as i64;
         let ch = canvas.h as i64;
+        // fully off-canvas — nothing to blend
+        if x0 >= cw || y0 >= ch || x0 + dw <= 0 || y0 + dh <= 0 {
+            return;
+        }
         let feathered = layer
             .mask
             .as_ref()
@@ -431,32 +667,29 @@ fn mask_at(m: &Mask, x: f32, y: f32) -> f32 {
     )
 }
 
-/// 3-pass box blur ≈ gaussian for mask feathering
-fn blur_mask(m: &Mask) -> Mask {
-    let r = m.feather.max(0.0).round() as usize;
-    if r == 0 {
-        return m.clone();
+/// separable box blur, `passes` iterations (3 ≈ gaussian), in place
+fn box_blur(data: &mut [f32], w: u32, h: u32, r: usize, passes: usize) {
+    let (w, h) = (w as usize, h as usize);
+    if r == 0 || w == 0 || h == 0 {
+        return;
     }
-    let (w, h) = (m.width as usize, m.height as usize);
-    let mut cur = m.data.clone();
     let mut tmp = vec![0.0f32; w * h];
-    for _ in 0..3 {
+    for _ in 0..passes {
         for y in 0..h {
             let mut s = 0.0f32;
             let mut n = 0usize;
-            // sliding window seeded at x=0
             for k in 0..(r + 1).min(w) {
-                s += cur[y * w + k];
+                s += data[y * w + k];
                 n += 1;
             }
             tmp[y * w] = s / n as f32;
             for x in 1..w {
                 if x + r < w {
-                    s += cur[y * w + x + r];
+                    s += data[y * w + x + r];
                     n += 1;
                 }
                 if x > r {
-                    s -= cur[y * w + x - r - 1];
+                    s -= data[y * w + x - r - 1];
                     n -= 1;
                 }
                 tmp[y * w + x] = s / n as f32;
@@ -470,12 +703,47 @@ fn blur_mask(m: &Mask) -> Mask {
                     s += tmp[k * w + x];
                     n += 1;
                 }
-                cur[y * w + x] = s / n as f32;
+                data[y * w + x] = s / n as f32;
             }
         }
     }
+}
+
+/// max-filter dilation of a scalar field (morphological grow), in place
+fn dilate(data: &mut [f32], w: u32, h: u32, r: usize) {
+    let (w, h) = (w as usize, h as usize);
+    if r == 0 || w == 0 || h == 0 {
+        return;
+    }
+    let mut tmp = vec![0.0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut m = 0.0f32;
+            for k in x.saturating_sub(r)..(x + r + 1).min(w) {
+                m = m.max(data[y * w + k]);
+            }
+            tmp[y * w + x] = m;
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let mut m = 0.0f32;
+            for k in y.saturating_sub(r)..(y + r + 1).min(h) {
+                m = m.max(tmp[k * w + x]);
+            }
+            data[y * w + x] = m;
+        }
+    }
+}
+
+/// 3-pass box blur ≈ gaussian for mask feathering
+fn blur_mask(m: &Mask) -> Mask {
+    let r = m.feather.max(0.0).round() as usize;
+    if r == 0 {
+        return m.clone();
+    }
     let mut out = m.clone();
-    out.data = cur;
+    box_blur(&mut out.data, m.width, m.height, r, 3);
     out.feather = 0.0;
     out
 }
