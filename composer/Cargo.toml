@@ -1,0 +1,24 @@
+[package]
+name = "koubou-composer"
+version = "0.1.0"
+edition = "2021"
+description = "koubou layered document engine: layers, masks, blend modes, vector shapes, text, compositor"
+
+[dependencies]
+koubou-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+base64 = "0.22"
+bytemuck = { version = "1", features = ["derive"] }
+tiny-skia = "0.11"
+fontdue = "0.9"
+fontdb = "0.23"
+psd = "0.3"
+rayon = "1"
+log = "0.4"
+
+[lib]
+crate-type = ["staticlib", "rlib"]

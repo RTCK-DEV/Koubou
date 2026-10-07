@@ -1,0 +1,4 @@
+/target
+mac/build/
+.DS_Store
+*.koubou

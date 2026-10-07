@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["core", "cli", "composer"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
