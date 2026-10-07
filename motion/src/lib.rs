@@ -13,5 +13,7 @@ pub mod render;
 pub mod session;
 pub mod text;
 
-pub use model::{eval_kf, kf_expr, Clip, Cue, Timeline, Track, TrackKind};
+pub use model::{
+    duck_keyframes, eval_kf, kf_expr, Clip, Cue, Timeline, Track, TrackKind, TransKind, Transition,
+};
 pub use session::{command_specs, TlSession};

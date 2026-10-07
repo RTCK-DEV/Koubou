@@ -58,6 +58,7 @@ impl TlSession {
             "tl.render",
             "tl.detectSilence",
             "tl.generateClip",
+            "tl.duck",
         ]
     }
 
@@ -302,13 +303,27 @@ impl TlSession {
                 Ok(json!(arr))
             }
             "tl.generateClip" => self.generate_clip(v),
+            "tl.duck" => {
+                let track = req_u64(v, "track")? as usize;
+                let cue_track = v
+                    .get("cueTrack")
+                    .and_then(Value::as_u64)
+                    .map(|i| i as usize);
+                let amount = opt_f64(v, "amount", 0.25);
+                let attack = opt_f64(v, "attack", 0.15);
+                let release = opt_f64(v, "release", 0.3);
+                let n = self.tl()?.duck(track, cue_track, amount, attack, release)?;
+                Ok(json!({"dipped": n}))
+            }
             _ => anyhow::bail!("unknown command id: {id}"),
         }
     }
 
     /// `tl.generateClip` — POST {prompt} to a minimax-h3 h3ui-style backend,
     /// poll the job, download the mp4, add it as a clip on `track`.
-    /// Params: endpoint (default http://127.0.0.1:8000), prompt, track,
+    /// Params: endpoint (default http://127.0.0.1:8000; loopback hosts only
+    /// unless `allowRemote: true`), prompt, track (default: first video
+    /// track, created when none exists),
     /// optional size/length/quality/seed/out/offset/timeoutSecs.
     fn generate_clip(&mut self, v: &Value) -> Result<Value> {
         let endpoint = v
@@ -316,21 +331,40 @@ impl TlSession {
             .and_then(Value::as_str)
             .unwrap_or("http://127.0.0.1:8000")
             .trim_end_matches('/');
+        // SSRF guard: the endpoint is posted to and polled with the job's
+        // paths — keep it loopback unless the caller opts out explicitly.
+        let allow_remote = v.get("allowRemote").and_then(Value::as_bool) == Some(true);
+        if !allow_remote && !is_loopback_endpoint(endpoint) {
+            anyhow::bail!(
+                "generateClip: endpoint '{endpoint}' is not a loopback host \
+                 (127.0.0.1, ::1, localhost) — pass allowRemote:true to override"
+            );
+        }
         let prompt = req_str(v, "prompt")?;
-        let track = req_u64(v, "track")? as usize;
         let timeout = opt_f64(v, "timeoutSecs", 1800.0).max(5.0);
         let out_path = v.get("out").and_then(Value::as_str).map(String::from);
 
-        // track must exist and be a video track before we spend a generation
-        {
-            let tl = self.tl()?;
-            let t = tl
-                .track(track)
-                .with_context(|| format!("track index {track} out of range"))?;
-            if t.kind != TrackKind::Video {
-                anyhow::bail!("track {track} is {:?}, not a video track", t.kind);
+        // resolve the track before we spend a generation: explicit index,
+        // else first video track, else create one.
+        let track = match v.get("track").and_then(Value::as_u64) {
+            Some(i) => {
+                let tl = self.tl()?;
+                let t = tl
+                    .track(i as usize)
+                    .with_context(|| format!("track index {i} out of range"))?;
+                if t.kind != TrackKind::Video {
+                    anyhow::bail!("track {i} is {:?}, not a video track", t.kind);
+                }
+                i as usize
             }
-        }
+            None => {
+                let tl = self.tl()?;
+                match tl.tracks.iter().position(|t| t.kind == TrackKind::Video) {
+                    Some(i) => i,
+                    None => tl.add_track(TrackKind::Video),
+                }
+            }
+        };
 
         // submit the job
         let mut body = json!({"prompt": prompt});
@@ -457,6 +491,42 @@ impl TlSession {
     }
 }
 
+/// `generateClip` endpoint guard: only http(s) to a loopback host unless
+/// the caller passes allowRemote. Hosts must parse as loopback IPs or the
+/// literal `localhost` — prefix matching would let `127.x.y.z.evil.com`
+/// and userinfo tricks (`evil.com@127.0.0.1` is fine; `127.0.0.1.evil.com`
+/// is not) through.
+fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let rest = match endpoint.split_once("://") {
+        Some((scheme, rest)) => {
+            if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+                return false;
+            }
+            rest
+        }
+        None => endpoint,
+    };
+    // host[:port] up to the first '/', after any userinfo
+    let hostport = rest.split('/').next().unwrap_or("");
+    let hostport = hostport.rsplit('@').next().unwrap_or("");
+    let host = if let Some(h) = hostport.strip_prefix('[') {
+        // [v6addr]:port
+        h.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or("")
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        return v4.is_loopback();
+    }
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        return v6.is_loopback();
+    }
+    false
+}
+
 /// curl returning parsed JSON (or an error for non-JSON bodies)
 fn curl_json(url: &str, args: &[String], timeout_secs: u64) -> Result<Value> {
     let bytes = ffmpeg::curl(url, args, timeout_secs)?;
@@ -513,7 +583,7 @@ pub fn command_specs() -> Vec<Value> {
         spec("tl.setTrack", "Edit a track (name, muted)", json!({"track": n("track index"), "name": s("name"), "muted": b("muted")}), &["track"]),
         spec("tl.removeTrack", "Remove a track and everything on it", json!({"track": n("track index")}), &["track"]),
         spec("tl.addClip", "Add a clip to a track — media via 'src' (needs 'out'), text via 'text' (optional 'dur')", json!({"track": n("track index"), "src": s("media path"), "text": s("text clip content"), "in": n("source in sec"), "out": n("source out sec"), "dur": n("text clip seconds"), "offset": n("timeline offset sec")}), &["track"]),
-        spec("tl.setClip", "Edit a clip (in/out/offset/opacity/scale/x/y/fadeIn/fadeOut — scalars or keyframe [[t,v]] lists)", json!({"clip": n("clip id")}), &["clip"]),
+        spec("tl.setClip", "Edit a clip (in/out/offset/opacity/scale/x/y/volume/fadeIn/fadeOut — scalars or keyframe [[t,v]] lists; volume v in 0..=2. transIn/transOut: {type:'slide'|'wipe'|'dip', dur:sec, color?:[r,g,b,a] 0-1} or null to clear — a set transition replaces that edge's fadeIn/fadeOut; slide/wipe animate position (wipe = slide for now), dip fades through color)", json!({"clip": n("clip id"), "in": n("source in sec"), "out": n("source out sec"), "offset": n("timeline offset sec"), "opacity": json!({"description": "scalar or [[t,v]] keyframes, 0..=1"}), "scale": json!({"description": "scalar or [[t,v]] keyframes"}), "x": json!({"description": "scalar or [[t,v]] keyframes, px right of centre"}), "y": json!({"description": "scalar or [[t,v]] keyframes, px below centre"}), "volume": json!({"description": "scalar or [[t,v]] keyframes, gain 0..=2"}), "fadeIn": n("fade-in sec"), "fadeOut": n("fade-out sec"), "transIn": json!({"type": "object", "description": "{type:'slide'|'wipe'|'dip', dur:sec, color?:[r,g,b,a]}", "properties": {"type": s("slide|wipe|dip"), "dur": n("sec"), "color": json!({"type": "array", "description": "[r,g,b,a] 0..=1 (dip only)"})}, "required": ["type", "dur"]}), "transOut": json!({"type": "object", "description": "same shape as transIn", "properties": {"type": s("slide|wipe|dip"), "dur": n("sec"), "color": json!({"type": "array", "description": "[r,g,b,a] 0..=1 (dip only)"})}, "required": ["type", "dur"]}), "text": s("text clip content")}), &["clip"]),
         spec("tl.removeClip", "Remove a clip", json!({"clip": n("clip id")}), &["clip"]),
         spec("tl.splitClip", "Split a clip at timeline second t into two clips", json!({"clip": n("clip id"), "t": n("timeline sec")}), &["clip", "t"]),
         spec("tl.duplicateClip", "Clone a clip onto its track right after the original", json!({"clip": n("clip id")}), &["clip"]),
@@ -524,7 +594,8 @@ pub fn command_specs() -> Vec<Value> {
         spec("tl.renderFrame", "Render one frame at t seconds (PNG to 'out', else pngB64 inline)", json!({"t": n("sec"), "out": s("output path")}), &["t"]),
         spec("tl.render", "Render the timeline to mp4 via ffmpeg", json!({"out": s("output path"), "burnSubs": b("burn subtitle cues")}), &["out"]),
         spec("tl.detectSilence", "ffmpeg silencedetect on a media file → [{start,end}]", json!({"path": s("media path"), "thresholdDB": n("dB, default -35"), "minDur": n("sec, default 0.5")}), &["path"]),
-        spec("tl.generateClip", "Generate a clip with a minimax-h3 h3ui-style backend and add it", json!({"endpoint": s("backend base URL, default http://127.0.0.1:8000"), "prompt": s("generation prompt"), "track": n("track index")}), &["prompt"]),
+        spec("tl.generateClip", "Generate a clip with a minimax-h3 h3ui-style backend and add it. endpoint is restricted to loopback hosts (127.x, ::1, localhost) unless allowRemote=true", json!({"endpoint": s("backend base URL, default http://127.0.0.1:8000; loopback only"), "allowRemote": b("allow a non-loopback endpoint (SSRF override)"), "prompt": s("generation prompt"), "track": n("track index; default = first video track, created if none"), "size": s("resolution"), "length": n("seconds"), "quality": s("quality"), "seed": n("rng seed"), "out": s("download path"), "offset": n("timeline offset sec; default = after last clip on the track"), "timeoutSecs": n("poll timeout, default 1800")}), &["prompt"]),
+        spec("tl.duck", "Duck a track's audio under subtitle cues: inserts volume keyframes on every non-text clip of the track so gain dips to `amount` while any cue on cueTrack (default: first subtitle track) is active — down-ramp `attack` s before, up-ramp `release` s after", json!({"track": n("video/audio track index to duck"), "cueTrack": n("subtitle track index; default = first"), "amount": n("gain during cues, default 0.25"), "attack": n("fade-down sec, default 0.15"), "release": n("fade-up sec, default 0.3")}), &["track"]),
     ]
 }
 
@@ -572,6 +643,7 @@ fn apply_clip_params(clip: &mut Clip, v: &Value) -> Result<()> {
         ("scale", &mut clip.scale),
         ("x", &mut clip.x),
         ("y", &mut clip.y),
+        ("volume", &mut clip.volume),
     ] {
         if let Some(val) = v.get(key) {
             *dst = parse_kfs(val).with_context(|| format!("bad keyframes for '{key}'"))?;
@@ -582,6 +654,20 @@ fn apply_clip_params(clip: &mut Clip, v: &Value) -> Result<()> {
     }
     if let Some(f) = v.get("fadeOut").and_then(Value::as_f64) {
         clip.fade_out = f.max(0.0);
+    }
+    for (key, slot) in [
+        ("transIn", &mut clip.trans_in),
+        ("transOut", &mut clip.trans_out),
+    ] {
+        if let Some(val) = v.get(key) {
+            *slot = if val.is_null() {
+                None
+            } else {
+                Some(serde_json::from_value(val.clone()).with_context(|| {
+                    format!("bad '{key}' — expected {{type: 'slide'|'wipe'|'dip', dur, color?}}")
+                })?)
+            };
+        }
     }
     if let Some(t) = v.get("text") {
         clip.text = if t.is_null() {
@@ -646,10 +732,11 @@ mod tests {
             "tl.render",
             "tl.detectSilence",
             "tl.generateClip",
+            "tl.duck",
         ] {
             assert!(ids.contains(&c), "missing {c}");
         }
-        assert_eq!(ids.len(), 20);
+        assert_eq!(ids.len(), 21);
     }
 
     #[test]
@@ -716,6 +803,134 @@ mod tests {
                 &json!({"t": 0.0, "dur": 1.0, "text": "x", "track": 1})
             )
             .is_err());
+    }
+
+    #[test]
+    fn setclip_transitions_and_volume() {
+        let mut s = sess_with_timeline();
+        s.dispatch("tl.addTrack", &json!({"kind": "video"}))
+            .unwrap();
+        let r = s
+            .dispatch(
+                "tl.addClip",
+                &json!({"track": 0, "src": "a.mp4", "in": 0.0, "out": 4.0}),
+            )
+            .unwrap();
+        let clip = r["clipId"].as_u64().unwrap();
+        s.dispatch(
+            "tl.setClip",
+            &json!({
+                "clip": clip,
+                "transIn": {"type": "slide", "dur": 0.5},
+                "transOut": {"type": "dip", "dur": 0.4, "color": [1.0, 1.0, 1.0, 1.0]},
+                "volume": [[0.0, 1.0], [2.0, 0.5]],
+            }),
+        )
+        .unwrap();
+        let doc = s.dispatch("tl.json", &json!({})).unwrap();
+        let c = &doc["tracks"][0]["clips"][0];
+        assert_eq!(c["transIn"]["type"], json!("slide"));
+        assert_eq!(c["transOut"]["type"], json!("dip"));
+        assert_eq!(c["volume"], json!([[0.0, 1.0], [2.0, 0.5]]));
+        // null clears a transition
+        s.dispatch("tl.setClip", &json!({"clip": clip, "transIn": null}))
+            .unwrap();
+        let doc = s.dispatch("tl.json", &json!({})).unwrap();
+        assert!(
+            doc["tracks"][0]["clips"][0]["transIn"].is_null()
+                || doc["tracks"][0]["clips"][0].get("transIn").is_none()
+        );
+        // a bad transition type is an error, not a panic
+        assert!(s
+            .dispatch(
+                "tl.setClip",
+                &json!({"clip": clip, "transIn": {"type": "spin", "dur": 1.0}})
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn duck_inserts_volume_keyframes() {
+        let mut s = sess_with_timeline();
+        s.dispatch("tl.addTrack", &json!({"kind": "audio"}))
+            .unwrap();
+        let r = s
+            .dispatch(
+                "tl.addClip",
+                &json!({"track": 0, "src": "a.m4a", "in": 0.0, "out": 10.0, "offset": 0.0}),
+            )
+            .unwrap();
+        let clip = r["clipId"].as_u64().unwrap();
+        s.dispatch("tl.addTrack", &json!({"kind": "subtitle"}))
+            .unwrap();
+        s.dispatch("tl.addCue", &json!({"t": 2.0, "dur": 2.0, "text": "hi"}))
+            .unwrap();
+        // no cue track arg → first subtitle track
+        let r = s
+            .dispatch(
+                "tl.duck",
+                &json!({"track": 0, "amount": 0.25, "attack": 0.5, "release": 0.5}),
+            )
+            .unwrap();
+        assert_eq!(r["dipped"], json!(1));
+        let doc = s.dispatch("tl.json", &json!({})).unwrap();
+        let vol = doc["tracks"][0]["clips"][0]["volume"].as_array().unwrap();
+        // expect 1→0.25 ramp from 1.5→2.0, hold, ramp back 4.0→4.5
+        let pts: Vec<(f64, f64)> = vol
+            .iter()
+            .map(|k| (k[0].as_f64().unwrap(), k[1].as_f64().unwrap()))
+            .collect();
+        assert_eq!(pts, vec![(1.5, 1.0), (2.0, 0.25), (4.0, 0.25), (4.5, 1.0)]);
+        // ducking a subtitle track is an error
+        assert!(s.dispatch("tl.duck", &json!({"track": 1})).is_err());
+        // unknown clip-less track is fine (no-op) but out-of-range errors
+        assert!(s.dispatch("tl.duck", &json!({"track": 9})).is_err());
+        let _ = clip;
+    }
+
+    #[test]
+    fn generate_clip_rejects_remote_endpoint() {
+        let mut s = sess_with_timeline();
+        // SSRF guard fires before any network use — even without a track
+        let e = s
+            .dispatch(
+                "tl.generateClip",
+                &json!({"endpoint": "http://169.254.169.254/latest", "prompt": "x"}),
+            )
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("loopback"), "{e:#}");
+        // loopback passes the guard (then fails on connect — that's fine)
+        let e2 = s
+            .dispatch(
+                "tl.generateClip",
+                &json!({"endpoint": "http://127.0.0.1:59998", "prompt": "x", "timeoutSecs": 5}),
+            )
+            .unwrap_err();
+        assert!(!format!("{e2:#}").contains("loopback"), "{e2:#}");
+        // allowRemote bypasses the guard (errors later on connect)
+        let e3 = s
+            .dispatch(
+                "tl.generateClip",
+                &json!({"endpoint": "http://169.254.169.254:9", "prompt": "x", "allowRemote": true, "timeoutSecs": 5}),
+            )
+            .unwrap_err();
+        assert!(!format!("{e3:#}").contains("loopback"), "{e3:#}");
+    }
+
+    #[test]
+    fn loopback_classifier() {
+        assert!(is_loopback_endpoint("http://127.0.0.1:8000"));
+        assert!(is_loopback_endpoint("http://localhost:8000"));
+        assert!(is_loopback_endpoint("http://[::1]:8000"));
+        assert!(is_loopback_endpoint("127.0.0.1:8000"));
+        assert!(is_loopback_endpoint("https://127.0.0.5"));
+        assert!(is_loopback_endpoint("http://user:pass@127.0.0.1:8000"));
+        assert!(!is_loopback_endpoint("http://169.254.169.254"));
+        assert!(!is_loopback_endpoint("http://example.com"));
+        assert!(!is_loopback_endpoint("file:///etc/passwd"));
+        assert!(!is_loopback_endpoint("http://127.0.0.1.evil.com"));
+        assert!(!is_loopback_endpoint("http://0.0.0.0:8000"));
+        assert!(!is_loopback_endpoint(""));
     }
 
     #[test]

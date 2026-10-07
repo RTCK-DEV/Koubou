@@ -43,8 +43,24 @@ final class MotionStore: ObservableObject {
         var scale: [[Double]]
         var fadeIn: Double
         var fadeOut: Double
+        var volume: [[Double]]
+        var transIn: TlTrans?
+        var transOut: TlTrans?
         var dur: Double { max(0.01, outPoint - inPoint) }
         var label: String { src.isEmpty ? "clip" : URL(fileURLWithPath: src).deletingPathExtension().lastPathComponent }
+    }
+    /// one transition edge (`transIn`/`transOut` on the clip)
+    struct TlTrans {
+        var kind: String // slide | wipe | dip
+        var dur: Double
+        var color: [Double]? // dip colour, rgba 0..1
+
+        /// JSON params for tl.setClip — nil omits `color`
+        var params: [String: Any] {
+            var p: [String: Any] = ["type": kind, "dur": dur]
+            if let color { p["color"] = color }
+            return p
+        }
     }
 
     private func ensure() -> DocSession? {
@@ -117,13 +133,16 @@ final class MotionStore: ObservableObject {
                 TlClip(
                     id: (c["id"] as? NSNumber)?.uint64Value ?? 0,
                     src: c["src"] as? String ?? "",
-                    inPoint: (c["in"] as? NSNumber)?.doubleValue ?? 0,
-                    outPoint: (c["out"] as? NSNumber)?.doubleValue ?? 1,
+                    inPoint: (c["inPoint"] as? NSNumber)?.doubleValue ?? 0,
+                    outPoint: (c["outPoint"] as? NSNumber)?.doubleValue ?? 1,
                     offset: (c["offset"] as? NSNumber)?.doubleValue ?? 0,
                     opacity: (c["opacity"] as? [[NSNumber]] ?? []).map { $0.map { $0.doubleValue } },
                     scale: (c["scale"] as? [[NSNumber]] ?? []).map { $0.map { $0.doubleValue } },
                     fadeIn: (c["fadeIn"] as? NSNumber)?.doubleValue ?? 0,
-                    fadeOut: (c["fadeOut"] as? NSNumber)?.doubleValue ?? 0)
+                    fadeOut: (c["fadeOut"] as? NSNumber)?.doubleValue ?? 0,
+                    volume: (c["volume"] as? [[NSNumber]] ?? []).map { $0.map { $0.doubleValue } },
+                    transIn: parseTrans(c["transIn"]),
+                    transOut: parseTrans(c["transOut"]))
             }
             return TlTrack(id: i, kind: t["kind"] as? String ?? "video",
                            muted: t["muted"] as? Bool ?? false,
@@ -198,9 +217,12 @@ final class MotionStore: ObservableObject {
                 $0.dispatch(["id": "tl.detectSilence", "path": clip.src])
             }
             await MainActor.run {
-                if let res = r["result"] as? [String: Any],
-                   let ranges = res["ranges"] as? [[String: NSNumber]] {
-                    self?.silenceRanges = ranges.map { ($0["start"]?.doubleValue ?? 0, $0["end"]?.doubleValue ?? 0) }
+                // tl.detectSilence returns a bare [{start, end}] array
+                if let ranges = r["result"] as? [[String: Any]] {
+                    self?.silenceRanges = ranges.map {
+                        (($0["start"] as? NSNumber)?.doubleValue ?? 0,
+                         ($0["end"] as? NSNumber)?.doubleValue ?? 0)
+                    }
                 }
             }
         }
@@ -255,14 +277,18 @@ final class MotionStore: ObservableObject {
     }
 
     /// minimax-h3 integration: prompt → h3ui backend → generated mp4 as clip.
+    /// `track` is optional engine-side (defaults to the first video track),
+    /// but pass the known index so the clip lands where the user expects.
     func generateClip(endpoint: String, prompt: String) {
         guard !prompt.isEmpty, let s = ensure() else { return }
         generating = true
+        var cmd: [String: Any] = ["id": "tl.generateClip",
+                                  "endpoint": endpoint, "prompt": prompt]
+        if let vt = tracks.firstIndex(where: { $0.kind == "video" }) {
+            cmd["track"] = vt
+        }
         Task.detached { [weak self] in
-            let r = await s.work {
-                $0.dispatch(["id": "tl.generateClip",
-                             "endpoint": endpoint, "prompt": prompt])
-            }
+            let r = await s.work { $0.dispatch(cmd) }
             await MainActor.run {
                 guard let self else { return }
                 self.generating = false
@@ -274,6 +300,42 @@ final class MotionStore: ObservableObject {
                 }
             }
         }
+    }
+
+    /// index of the track holding `clipId` (track params are array indices)
+    func trackIndex(of clipId: UInt64) -> Int? {
+        tracks.firstIndex(where: { $0.clips.contains(where: { $0.id == clipId }) })
+    }
+
+    /// duck the selected clip's track under subtitle cues (tl.duck)
+    func duckSelected(amount: Double = 0.25) {
+        guard let id = selectedClip, let ti = trackIndex(of: id) else {
+            error = "select a clip to duck"
+            return
+        }
+        guard tracks[ti].kind != "subtitle" else {
+            error = "select a video/audio clip — subtitles can't be ducked"
+            return
+        }
+        dispatch(["id": "tl.duck", "track": ti, "amount": amount], then: .preview)
+    }
+
+    /// rewrite the whole volume keyframe list on a clip
+    func setVolume(_ id: UInt64, _ kfs: [[Double]]) {
+        setClip(id, ["volume": kfs])
+    }
+
+    /// set/clear a transition edge; nil clears
+    func setTransition(_ id: UInt64, key: String, _ tr: TlTrans?) {
+        setClip(id, [key: tr?.params as Any ?? NSNull()])
+    }
+
+    private func parseTrans(_ any: Any?) -> TlTrans? {
+        guard let d = any as? [String: Any],
+              let kind = d["type"] as? String else { return nil }
+        let dur = (d["dur"] as? NSNumber)?.doubleValue ?? 0.5
+        let color = (d["color"] as? [NSNumber])?.map { $0.doubleValue }
+        return TlTrans(kind: kind, dur: dur, color: color)
     }
 }
 
@@ -392,49 +454,176 @@ struct MotionView: View {
     }
 
     private var inspector: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Clip").font(.headline)
-            if let id = m.selectedClip,
-               let c = m.tracks.flatMap(\.clips).first(where: { $0.id == id }) {
-                LabeledContent("Source", value: c.label)
-                kv("In", c.inPoint) { m.setClip(id, ["in": $0]) }
-                kv("Out", c.outPoint) { m.setClip(id, ["out": $0]) }
-                kv("Offset", c.offset) { m.setClip(id, ["offset": $0]) }
-                kv("Fade in", c.fadeIn) { m.setClip(id, ["fadeIn": $0]) }
-                kv("Fade out", c.fadeOut) { m.setClip(id, ["fadeOut": $0]) }
-                Divider()
-                Button("Detect Silence") { m.detectSilence() }
-                if !m.silenceRanges.isEmpty {
-                    ForEach(m.silenceRanges.indices, id: \.self) { i in
-                        let r = m.silenceRanges[i]
-                        Text(String(format: "silent %.1f–%.1fs", r.0, r.1))
-                            .font(.caption).foregroundStyle(.secondary)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 10) {
+                if let id = m.selectedClip,
+                   let c = m.tracks.flatMap(\.clips).first(where: { $0.id == id }) {
+                    Panel("Clip") {
+                        LabeledContent("Source", value: c.label).font(.caption)
+                        kv("In", c.inPoint) { m.setClip(id, ["in": $0]) }
+                        kv("Out", c.outPoint) { m.setClip(id, ["out": $0]) }
+                        kv("Offset", c.offset) { m.setClip(id, ["offset": $0]) }
+                        kv("Fade in", c.fadeIn) { m.setClip(id, ["fadeIn": $0]) }
+                        kv("Fade out", c.fadeOut) { m.setClip(id, ["fadeOut": $0]) }
+                    }
+                    Panel("Transitions") {
+                        transitionEdge(id, edge: "In", key: "transIn", cur: c.transIn)
+                        transitionEdge(id, edge: "Out", key: "transOut", cur: c.transOut)
+                    }
+                    Panel("Audio") {
+                        volumeEditor(c)
+                        ToolChip(label: "Duck under subtitles", icon: "chevron.down.circle") {
+                            m.duckSelected()
+                        }
+                    }
+                    Panel("Tools") {
+                        HStack(spacing: 6) {
+                            ToolChip(label: "Detect Silence", icon: "waveform") { m.detectSilence() }
+                            ToolChip(label: m.transcribing ? "Transcribing…" : "Transcribe → Subs",
+                                     icon: "text.bubble") { m.transcribe() }
+                                .disabled(m.transcribing)
+                        }
+                        if !m.silenceRanges.isEmpty {
+                            ForEach(m.silenceRanges.indices, id: \.self) { i in
+                                let r = m.silenceRanges[i]
+                                Text(String(format: "silent %.1f–%.1fs", r.0, r.1))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Button("Remove Clip", role: .destructive) { m.removeClip() }
+                            .buttonStyle(KouSecondaryButton())
+                    }
+                } else {
+                    Panel("Clip") {
+                        Text("Select a clip").font(.caption).foregroundStyle(.secondary)
                     }
                 }
-                Divider()
-                Button(m.transcribing ? "Transcribing…" : "Transcribe → Subtitles") {
-                    m.transcribe()
+                Panel("Generate clip (minimax-h3)") {
+                    TextField("Endpoint", text: $genEndpoint)
+                        .textFieldStyle(.roundedBorder).font(.caption)
+                    TextField("Prompt", text: $genPrompt, axis: .vertical)
+                        .textFieldStyle(.roundedBorder).font(.caption).lineLimit(3)
+                    Button(m.generating ? "Generating…" : "Generate") {
+                        m.generateClip(endpoint: genEndpoint, prompt: genPrompt)
+                    }
+                    .buttonStyle(KouPrimaryButton())
+                    .disabled(m.generating || genPrompt.isEmpty)
                 }
-                .disabled(m.transcribing)
-                Button("Remove Clip", role: .destructive) { m.removeClip() }
-            } else {
-                Text("Select a clip").foregroundStyle(.secondary)
             }
-            Divider()
-            DisclosureGroup("Generate clip (minimax-h3)") {
-                TextField("Endpoint", text: $genEndpoint)
-                    .textFieldStyle(.roundedBorder).font(.caption)
-                TextField("Prompt", text: $genPrompt, axis: .vertical)
-                    .textFieldStyle(.roundedBorder).font(.caption).lineLimit(3)
-                Button(m.generating ? "Generating…" : "Generate") {
-                    m.generateClip(endpoint: genEndpoint, prompt: genPrompt)
-                }
-                .disabled(m.generating || genPrompt.isEmpty)
-            }
-            Spacer()
+            .padding(10)
         }
-        .padding(12)
-        .background(Kou.bg2)
+        .background(Kou.bg0)
+    }
+
+    /// None/Slide/Wipe/Dip picker + duration (+ dip colour for dips)
+    private func transitionEdge(_ id: UInt64, edge: String, key: String,
+                                cur: MotionStore.TlTrans?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(edge).font(.caption).foregroundStyle(Kou.text2)
+                    .frame(width: 24, alignment: .leading)
+                SegPicker([( "", "None" ), ("slide", "Slide"), ("wipe", "Wipe"), ("dip", "Dip")],
+                          selection: Binding(
+                              get: { cur?.kind ?? "" },
+                              set: { nk in
+                                  if nk.isEmpty {
+                                      m.setTransition(id, key: key, nil)
+                                  } else {
+                                      var t = MotionStore.TlTrans(kind: nk, dur: cur?.dur ?? 0.5, color: cur?.color)
+                                      if nk == "dip" && t.color == nil { t.color = [0, 0, 0, 1] }
+                                      m.setTransition(id, key: key, t)
+                                  }
+                              }))
+            }
+            if let cur {
+                kv("Dur s", cur.dur) { d in
+                    var t = cur
+                    t.dur = max(0, d)
+                    m.setTransition(id, key: key, t)
+                }
+                if cur.kind == "dip" {
+                    dipColorRow(id, key: key, cur: cur)
+                }
+            }
+        }
+    }
+
+    /// dip colour swatches: a few presets + free pick
+    private func dipColorRow(_ id: UInt64, key: String,
+                             cur: MotionStore.TlTrans) -> some View {
+        HStack(spacing: 6) {
+            Text("Colour").font(.caption).foregroundStyle(Kou.text2)
+                .frame(width: 40, alignment: .leading)
+            ForEach([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.85, 0.3, 0.25]], id: \.self) { rgb in
+                Button {
+                    var t = cur
+                    t.color = [rgb[0], rgb[1], rgb[2], 1.0]
+                    m.setTransition(id, key: key, t)
+                } label: {
+                    Circle()
+                        .fill(Color(red: rgb[0], green: rgb[1], blue: rgb[2]))
+                        .frame(width: 14, height: 14)
+                        .overlay(Circle().stroke(Kou.border, lineWidth: 0.5))
+                }
+                .buttonStyle(.plain)
+            }
+            ColorPicker("", selection: Binding(
+                get: {
+                    let c = cur.color ?? [0, 0, 0, 1]
+                    return Color(red: c[0], green: c[1], blue: c[2])
+                },
+                set: { col in
+                    let ns = NSColor(col).usingColorSpace(.sRGB) ?? .black
+                    var t = cur
+                    t.color = [ns.redComponent, ns.greenComponent, ns.blueComponent, 1.0]
+                    m.setTransition(id, key: key, t)
+                }))
+                .labelsHidden().frame(width: 24)
+        }
+    }
+
+    /// minimal volume keyframe list: t → gain rows with add/remove
+    private func volumeEditor(_ c: MotionStore.TlClip) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Volume kf").font(.caption).foregroundStyle(Kou.text2)
+                Spacer()
+                IconAction(icon: "plus", label: "at playhead") {
+                    let t = max(0, m.playhead - c.offset)
+                    var kfs = c.volume
+                    kfs.append([t, 1.0])
+                    kfs.sort { $0[0] < $1[0] }
+                    m.setVolume(c.id, kfs)
+                }
+            }
+            if c.volume.isEmpty {
+                Text("unity gain").font(.caption2).foregroundStyle(Kou.text3)
+            }
+            ForEach(Array(c.volume.enumerated()), id: \.offset) { i, kf in
+                HStack(spacing: 6) {
+                    Text(String(format: "%.2fs", kf[0]))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Kou.text2)
+                        .frame(width: 44, alignment: .leading)
+                    Slider(value: Binding(
+                        get: { kf[1] },
+                        set: { v in
+                            var kfs = c.volume
+                            kfs[i][1] = v
+                            m.setVolume(c.id, kfs)
+                        }), in: 0...2)
+                    Text(String(format: "%.2f", kf[1]))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Kou.text3)
+                        .frame(width: 34, alignment: .trailing)
+                    IconAction(icon: "minus") {
+                        var kfs = c.volume
+                        kfs.remove(at: i)
+                        m.setVolume(c.id, kfs)
+                    }
+                }
+            }
+        }
     }
 
     private func kv(_ label: String, _ val: Double, commit: @escaping (Double) -> Void) -> some View {

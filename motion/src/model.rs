@@ -20,6 +20,66 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// per-edge clip transition (`transIn`/`transOut`): `slide`/`wipe` animate
+/// the clip's position (wipe rides the same motion, no separate mask yet);
+/// `dip` fades through a solid colour via an underlay element + alpha ramp.
+/// A transition replaces that edge's plain fade when set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transition {
+    /// "slide" | "wipe" | "dip"
+    #[serde(rename = "type")]
+    pub kind: TransKind,
+    /// transition length in seconds
+    #[serde(default)]
+    pub dur: f64,
+    /// dip colour [r,g,b,a] 0..=1 (default black)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 4]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransKind {
+    Wipe,
+    Slide,
+    Dip,
+}
+
+impl Transition {
+    /// dip colour as rgba bytes (src-over), default opaque black
+    pub fn dip_rgba8(&self) -> [u8; 4] {
+        let c = self.color.unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        [
+            (c[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (c[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (c[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+            (c[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]
+    }
+
+    /// dip colour as an ffmpeg `color=` hex literal (`0xRRGGBB`)
+    pub fn dip_hex(&self) -> String {
+        let c = self.dip_rgba8();
+        format!("0x{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+    }
+
+    /// clamp hostile values; `clip_dur` caps the window
+    pub(crate) fn sanitize(&mut self, clip_dur: f64) {
+        if !self.dur.is_finite() {
+            self.dur = 0.0;
+        }
+        self.dur = self.dur.clamp(0.0, clip_dur.max(0.0));
+        if let Some(c) = &mut self.color {
+            for v in c.iter_mut() {
+                if !v.is_finite() {
+                    *v = 0.0;
+                }
+                *v = v.clamp(0.0, 1.0);
+            }
+        }
+    }
+}
+
 /// current .kmotion document version
 pub const KMT_VERSION: u32 = 1;
 
@@ -167,6 +227,7 @@ impl Timeline {
         let (sc_a, sc_b) = split(&clip.scale);
         let (x_a, x_b) = split(&clip.x);
         let (y_a, y_b) = split(&clip.y);
+        let (vo_a, vo_b) = split(&clip.volume);
         let mut b = clip;
         b.in_point += local;
         b.offset = t;
@@ -174,17 +235,21 @@ impl Timeline {
         b.scale = sc_b;
         b.x = x_b;
         b.y = y_b;
+        b.volume = vo_b;
         {
             let a = &mut self.tracks[ti].clips[ci];
             a.out_point = a.in_point + local;
             a.fade_out = 0.0;
+            a.trans_out = None; // the seam is a cut, not the clip's tail
             a.opacity = op_a;
             a.scale = sc_a;
             a.x = x_a;
             a.y = y_a;
+            a.volume = vo_a;
             a.sanitize();
         }
         b.fade_in = 0.0;
+        b.trans_in = None; // the cut edge keeps no in-transition
         b.sanitize();
         b.id = self.next_id;
         self.next_id += 1;
@@ -233,6 +298,90 @@ impl Timeline {
         t.cues
             .sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
         Ok(())
+    }
+
+    /// duck the clips on `track` under the cue windows of `cue_track` (or
+    /// the first subtitle track): every non-text clip gains volume
+    /// keyframes ramping its gain down to `amount` `attack` seconds before
+    /// each cue and back `release` seconds after it. Merges overlapping
+    /// cue spans; combines with existing volume keyframes by multiplying
+    /// the two curves at every knot. Returns the number of clips changed.
+    pub fn duck(
+        &mut self,
+        track: usize,
+        cue_track: Option<usize>,
+        amount: f64,
+        attack: f64,
+        release: f64,
+    ) -> Result<usize> {
+        let amount = amount.clamp(0.0, 1.0);
+        let attack = attack.max(0.0);
+        let release = release.max(0.0);
+        let ci = match cue_track {
+            Some(i) => {
+                let t = self
+                    .tracks
+                    .get(i)
+                    .with_context(|| format!("cue track index {i} out of range"))?;
+                if t.kind != TrackKind::Subtitle {
+                    anyhow::bail!("track {i} is {:?}, not a subtitle track", t.kind);
+                }
+                i
+            }
+            None => self
+                .tracks
+                .iter()
+                .position(|t| t.kind == TrackKind::Subtitle)
+                .context("no subtitle track — add one with tl.addTrack kind=subtitle")?,
+        };
+        // merged cue windows (sorted, overlapping/touching spans unioned)
+        let mut spans: Vec<(f64, f64)> = self.tracks[ci]
+            .cues
+            .iter()
+            .filter(|c| c.dur > 0.0)
+            .map(|c| (c.t, c.end()))
+            .collect();
+        spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut merged: Vec<(f64, f64)> = Vec::new();
+        for (s, e) in spans {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+            }
+            merged.push((s, e));
+        }
+        if merged.is_empty() {
+            anyhow::bail!("subtitle track {ci} has no cues to duck under");
+        }
+        let tr = self
+            .tracks
+            .get_mut(track)
+            .with_context(|| format!("track index {track} out of range"))?;
+        if tr.kind == TrackKind::Subtitle {
+            anyhow::bail!("track {track} is a subtitle track — duck a video or audio track");
+        }
+        let mut n = 0usize;
+        for clip in &mut tr.clips {
+            if clip.is_text() || clip.duration() <= 0.0 {
+                continue;
+            }
+            // cue spans in clip-local seconds, intersected with the clip
+            let dip: Vec<(f64, f64)> = merged
+                .iter()
+                .map(|(s, e)| (s - clip.offset, e - clip.offset))
+                .filter(|(s, e)| *e > 0.0 && *s < clip.duration())
+                .collect();
+            if dip.is_empty() {
+                continue;
+            }
+            clip.volume =
+                duck_keyframes(&clip.volume, &dip, clip.duration(), amount, attack, release);
+            clip.sanitize();
+            n += 1;
+        }
+        Ok(n)
     }
 
     /// timeline end in seconds: latest clip end or cue end
@@ -407,6 +556,15 @@ pub struct Clip {
     /// fade-out transition length, seconds
     #[serde(default, skip_serializing_if = "is_zero")]
     pub fade_out: f64,
+    /// volume gain keyframes [[t, v]] clip-local seconds, v in 0..=2
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volume: Vec<[f64; 2]>,
+    /// in-transition (slide/wipe/dip); replaces the plain fade-in when set
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trans_in: Option<Transition>,
+    /// out-transition; replaces the plain fade-out when set
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trans_out: Option<Transition>,
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -429,6 +587,9 @@ impl Clip {
             y: Vec::new(),
             fade_in: 0.0,
             fade_out: 0.0,
+            volume: Vec::new(),
+            trans_in: None,
+            trans_out: None,
         }
     }
 
@@ -479,17 +640,85 @@ impl Clip {
         eval_kf(&self.y, local, 0.0)
     }
 
-    /// fade-in/out gain at clip-local time, 0..=1
+    /// effective fade-in length: a `trans_in` replaces the plain fade —
+    /// dip fades over `trans_in.dur`, slide/wipe don't fade at all.
+    pub fn eff_fade_in(&self) -> f64 {
+        match &self.trans_in {
+            Some(t) if t.kind == TransKind::Dip => t.dur,
+            Some(_) => 0.0,
+            None => self.fade_in,
+        }
+    }
+
+    /// effective fade-out length (see `eff_fade_in`)
+    pub fn eff_fade_out(&self) -> f64 {
+        match &self.trans_out {
+            Some(t) if t.kind == TransKind::Dip => t.dur,
+            Some(_) => 0.0,
+            None => self.fade_out,
+        }
+    }
+
+    /// fade-in/out gain at clip-local time, 0..=1 (effective fades)
     pub fn fade_gain(&self, local: f64) -> f64 {
         let dur = self.duration();
+        let fi = self.eff_fade_in();
+        let fo = self.eff_fade_out();
         let mut g = 1.0_f64;
-        if self.fade_in > 0.0 && local < self.fade_in {
-            g *= (local / self.fade_in).clamp(0.0, 1.0);
+        if fi > 0.0 && local < fi {
+            g *= (local / fi).clamp(0.0, 1.0);
         }
-        if self.fade_out > 0.0 && local > dur - self.fade_out {
-            g *= ((dur - local) / self.fade_out).clamp(0.0, 1.0);
+        if fo > 0.0 && local > dur - fo {
+            g *= ((dur - local) / fo).clamp(0.0, 1.0);
         }
         g
+    }
+
+    /// volume gain at clip-local time, 0..=2 (audio-only; visual no-op)
+    pub fn volume_at(&self, local: f64) -> f64 {
+        eval_kf(&self.volume, local, 1.0).clamp(0.0, 2.0)
+    }
+
+    /// horizontal transition offset at clip-local time, in pixels of the
+    /// clip's own width `w`: slide/wipe-in animates -w -> 0, slide/wipe-out
+    /// 0 -> +w. Dip has no positional component.
+    pub fn trans_dx(&self, local: f64, w: f64) -> f64 {
+        let cd = self.duration();
+        let mut dx = 0.0;
+        if let Some(tr) = &self.trans_in {
+            if matches!(tr.kind, TransKind::Slide | TransKind::Wipe)
+                && tr.dur > 0.0
+                && local < tr.dur
+            {
+                dx += -w * (1.0 - (local / tr.dur).clamp(0.0, 1.0));
+            }
+        }
+        if let Some(tr) = &self.trans_out {
+            if matches!(tr.kind, TransKind::Slide | TransKind::Wipe) && tr.dur > 0.0 {
+                let start = cd - tr.dur;
+                if local > start {
+                    dx += w * ((local - start) / tr.dur).clamp(0.0, 1.0);
+                }
+            }
+        }
+        dx
+    }
+
+    /// the dip colour underlay active at clip-local time, if any: dip-in
+    /// covers [0, dur), dip-out covers [end-dur, end). Renderers draw this
+    /// colour under the clip while its alpha ramps through the window.
+    pub fn dip_underlay(&self, local: f64) -> Option<[u8; 4]> {
+        if let Some(tr) = &self.trans_in {
+            if tr.kind == TransKind::Dip && tr.dur > 0.0 && local < tr.dur {
+                return Some(tr.dip_rgba8());
+            }
+        }
+        if let Some(tr) = &self.trans_out {
+            if tr.kind == TransKind::Dip && tr.dur > 0.0 && local > self.duration() - tr.dur {
+                return Some(tr.dip_rgba8());
+            }
+        }
+        None
     }
 
     /// combined opacity * fade gain at clip-local time
@@ -515,7 +744,20 @@ impl Clip {
         self.out_point = self.out_point.max(self.in_point);
         self.fade_in = self.fade_in.clamp(0.0, self.duration());
         self.fade_out = self.fade_out.clamp(0.0, self.duration());
-        for kfs in [&mut self.opacity, &mut self.scale, &mut self.x, &mut self.y] {
+        let cd = self.duration();
+        if let Some(t) = &mut self.trans_in {
+            t.sanitize(cd);
+        }
+        if let Some(t) = &mut self.trans_out {
+            t.sanitize(cd);
+        }
+        for kfs in [
+            &mut self.opacity,
+            &mut self.scale,
+            &mut self.x,
+            &mut self.y,
+            &mut self.volume,
+        ] {
             kfs.retain(|k| k[0].is_finite() && k[1].is_finite());
             kfs.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
         }
@@ -551,6 +793,62 @@ impl Cue {
         self.t = self.t.max(0.0);
         self.dur = self.dur.max(0.0);
     }
+}
+
+/// ducking curve: volume keyframes dipping to `amount` across each
+/// clip-local span `(a, b)` — down-ramp `attack` before a, up-ramp
+/// `release` after b. Times outside [0, dur] are kept (a ramp starting
+/// before the clip just resumes mid-way). Merges with existing keyframes
+/// by evaluating both curves at the union of their knots — the dip is
+/// multiplicative so authored fades still apply.
+pub fn duck_keyframes(
+    existing: &[[f64; 2]],
+    spans: &[(f64, f64)],
+    clip_dur: f64,
+    amount: f64,
+    attack: f64,
+    release: f64,
+) -> Vec<[f64; 2]> {
+    // the dip shape alone: 1 → amount over `attack`, hold, → 1 over `release`
+    let mut shape: Vec<[f64; 2]> = Vec::new();
+    for &(a, b) in spans {
+        shape.push([a - attack, 1.0]);
+        shape.push([a, amount]);
+        shape.push([b, amount]);
+        shape.push([b + release, 1.0]);
+    }
+    shape.sort_by(|x, y| x[0].partial_cmp(&y[0]).unwrap_or(std::cmp::Ordering::Equal));
+    shape.retain(|k| k[0].is_finite());
+    // prune to the clip window plus one ramp of slack each side — knots
+    // outside are unreachable and would only noise up the kf list
+    let lo = -attack - 1.0;
+    let hi = clip_dur + release + 1.0;
+    shape.retain(|k| (lo..=hi).contains(&k[0]));
+    if existing.is_empty() {
+        return shape;
+    }
+    // combined curve = existing * shape. Shape knots are kept verbatim
+    // (including duplicate-t step pairs — dropping one side would turn a
+    // hard cut into a slow ramp); existing knots that don't collide with
+    // a shape knot are sampled against the shape curve.
+    let mut out: Vec<[f64; 2]> = Vec::new();
+    for &[t, v] in &shape {
+        if !(lo..=hi).contains(&t) {
+            continue;
+        }
+        out.push([t, (v * eval_kf(existing, t, 1.0)).clamp(0.0, 2.0)]);
+    }
+    for &[t, v] in existing {
+        if !(lo..=hi).contains(&t) || !t.is_finite() {
+            continue;
+        }
+        if shape.iter().any(|k| (k[0] - t).abs() < 1e-9) {
+            continue; // already sampled by the shape side
+        }
+        out.push([t, (v * eval_kf(&shape, t, 1.0)).clamp(0.0, 2.0)]);
+    }
+    out.sort_by(|x, y| x[0].partial_cmp(&y[0]).unwrap_or(std::cmp::Ordering::Equal));
+    out
 }
 
 /// linear-interpolated keyframe evaluation; `kfs` is `[[t, v]]` sorted by t.
@@ -737,5 +1035,164 @@ mod tests {
         assert_eq!(c.out_point, c.in_point); // clamped to >= in
         assert_eq!(c.fade_in, 0.0); // fadeIn clamped to duration (0)
         assert_eq!(c.opacity[0], [1.0, 0.5]); // sorted by t
+    }
+
+    fn clip(dur: f64) -> Clip {
+        Clip::media("a.mp4", 0.0, dur, 0.0)
+    }
+
+    #[test]
+    fn transition_sanitize() {
+        let mut c = clip(4.0);
+        c.trans_in = Some(Transition {
+            kind: TransKind::Slide,
+            dur: 99.0,
+            color: None,
+        });
+        c.trans_out = Some(Transition {
+            kind: TransKind::Dip,
+            dur: -2.0,
+            color: Some([2.0, f32::NAN, 0.5, 1.0]),
+        });
+        c.sanitize();
+        assert_eq!(c.trans_in.as_ref().map(|t| t.dur), Some(4.0)); // clamped to clip dur
+        assert_eq!(c.trans_out.as_ref().map(|t| t.dur), Some(0.0));
+        let col = c.trans_out.as_ref().unwrap().color.unwrap();
+        assert_eq!(col[0], 1.0); // >1 clamped
+        assert!(col[1].is_finite() && col[1] == 0.0); // NaN -> 0
+                                                      // serde: camelCase names
+        c.trans_in = None;
+        c.trans_out = Some(Transition {
+            kind: TransKind::Dip,
+            dur: 0.5,
+            color: Some([1.0, 1.0, 1.0, 1.0]),
+        });
+        let j = serde_json::to_value(&c).unwrap();
+        assert_eq!(j["transOut"]["type"], serde_json::json!("dip"));
+        let parsed: Clip = serde_json::from_str(
+            r#"{"id":1,"src":"a","inPoint":0,"outPoint":4,"offset":0,
+               "transIn":{"type":"wipe","dur":0.5}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.trans_in.map(|t| t.kind), Some(TransKind::Wipe));
+    }
+
+    #[test]
+    fn volume_at_eval() {
+        let mut c = clip(4.0);
+        assert_eq!(c.volume_at(2.0), 1.0); // empty = unity
+        c.volume = vec![[1.0, 1.0], [2.0, 0.0], [3.0, 2.0]];
+        assert_eq!(c.volume_at(0.5), 1.0); // before first knot holds first val
+        assert_eq!(c.volume_at(1.5), 0.5);
+        assert_eq!(c.volume_at(2.5), 1.0);
+        assert_eq!(c.volume_at(9.0), 2.0); // after last knot, clamped 0..=2
+    }
+
+    #[test]
+    fn transitions_drive_dx_and_underlay() {
+        let mut c = clip(4.0);
+        c.offset = 10.0;
+        c.trans_in = Some(Transition {
+            kind: TransKind::Slide,
+            dur: 1.0,
+            color: None,
+        });
+        // halfway through slide-in at 200px wide → -100px offset
+        assert_eq!(c.trans_dx(0.5, 200.0), -100.0);
+        assert_eq!(c.trans_dx(1.0, 200.0), 0.0);
+        assert_eq!(c.trans_dx(2.0, 200.0), 0.0); // past window
+        assert!(c.dip_underlay(0.5).is_none()); // slide has no underlay
+        c.trans_in = Some(Transition {
+            kind: TransKind::Dip,
+            dur: 0.5,
+            color: Some([1.0, 0.0, 0.0, 1.0]),
+        });
+        assert_eq!(c.dip_underlay(0.25), Some([255, 0, 0, 255]));
+        assert_eq!(c.dip_underlay(1.0), None);
+        // dip replaces plain fade for the alpha ramp
+        c.fade_in = 0.9;
+        assert_eq!(c.eff_fade_in(), 0.5);
+        c.trans_in = None;
+        assert_eq!(c.eff_fade_in(), 0.9);
+    }
+
+    #[test]
+    fn duck_keyframes_shape() {
+        // no existing volume → plain dip shape with ramps
+        let k = duck_keyframes(&[], &[(2.0, 4.0)], 10.0, 0.25, 0.5, 0.5);
+        assert_eq!(k, vec![[1.5, 1.0], [2.0, 0.25], [4.0, 0.25], [4.5, 1.0]]);
+        // zero attack/release → duplicate knots encode an instant step:
+        // eval gives the pre-value just before the boundary, the dip value
+        // at and after it
+        let k2 = duck_keyframes(&[], &[(2.0, 4.0), (7.0, 8.0)], 10.0, 0.5, 0.0, 0.0);
+        assert_eq!(
+            k2,
+            vec![
+                [2.0, 1.0],
+                [2.0, 0.5],
+                [4.0, 0.5],
+                [4.0, 1.0],
+                [7.0, 1.0],
+                [7.0, 0.5],
+                [8.0, 0.5],
+                [8.0, 1.0]
+            ]
+        );
+        assert_eq!(eval_kf(&k2, 3.0, 1.0), 0.5); // dipped mid-span
+        assert_eq!(eval_kf(&k2, 6.0, 1.0), 1.0); // recovered between spans
+                                                 // existing keyframes multiply the dip curve: base 0.5 × dip 0.25
+                                                 // → 0.125 held inside the span (duplicate-t knots keep it a hard
+                                                 // step, not a slow ramp)
+        let k3 = duck_keyframes(
+            &[[0.0, 0.5], [10.0, 0.5]],
+            &[(2.0, 4.0)],
+            10.0,
+            0.25,
+            0.0,
+            0.0,
+        );
+        assert_eq!(eval_kf(&k3, 3.0, 1.0), 0.125, "{k3:?}");
+        assert_eq!(eval_kf(&k3, 1.0, 1.0), 0.5, "{k3:?}");
+        assert_eq!(eval_kf(&k3, 5.0, 1.0), 0.5, "{k3:?}");
+        assert!(k3.iter().all(|k| (0.0..=2.0).contains(&k[1])));
+        // clip boundary clamps
+        let k4 = duck_keyframes(&[], &[(0.0, 20.0)], 5.0, 0.5, 1.0, 1.0);
+        assert!(k4.iter().all(|k| k[0] >= -1.0 - 1e-9 && k[0] <= 6.0 + 1e-9));
+    }
+
+    #[test]
+    fn duck_end_to_end_on_timeline() {
+        let mut tl = Timeline::new("t", 640, 480, 30.0);
+        let at = tl.add_track(TrackKind::Audio);
+        let st = tl.add_track(TrackKind::Subtitle);
+        tl.add_clip(at, Clip::media("a.m4a", 0.0, 10.0, 0.0))
+            .unwrap();
+        tl.add_cue(
+            Some(st),
+            Cue {
+                t: 2.0,
+                dur: 3.0,
+                text: "one".into(),
+            },
+        )
+        .unwrap();
+        tl.add_cue(
+            Some(st),
+            Cue {
+                t: 6.0,
+                dur: 1.0,
+                text: "two".into(),
+            },
+        )
+        .unwrap();
+        let n = tl.duck(at, None, 0.25, 0.5, 0.5).unwrap();
+        assert_eq!(n, 1);
+        let c = &tl.tracks[at].clips[0];
+        assert_eq!(c.volume_at(1.0), 1.0);
+        assert_eq!(c.volume_at(3.0), 0.25);
+        assert_eq!(c.volume_at(6.5), 0.25);
+        assert_eq!(c.volume_at(9.5), 1.0);
+        // ducking the subtitle track itself errors
+        assert!(tl.duck(st, None, 0.25, 0.5, 0.5).is_err());
     }
 }

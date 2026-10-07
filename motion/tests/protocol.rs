@@ -66,7 +66,7 @@ fn dispatch(s: &mut TlSession, v: Value) -> Value {
 #[test]
 fn doc_cycle_and_duration() {
     let mut s = TlSession::new();
-    assert_eq!(TlSession::command_ids().len(), 20);
+    assert_eq!(TlSession::command_ids().len(), 21);
     dispatch(
         &mut s,
         json!({"id": "tl.new", "w": 320, "h": 240, "fps": 24, "name": "doc"}),
@@ -279,4 +279,161 @@ fn generate_clip_endpoint_down_errors_cleanly() {
         msg.contains("cannot reach") || msg.contains("failed"),
         "{msg}"
     );
+}
+
+/// mean absolute per-channel difference between two RGBA images
+fn mad(a: &image::RgbaImage, b: &image::RgbaImage) -> f64 {
+    let (w, h) = (a.width().min(b.width()), a.height().min(b.height()));
+    let mut acc = 0u64;
+    let mut n = 0u64;
+    for y in 0..h {
+        for x in 0..w {
+            let p = a.get_pixel(x, y);
+            let q = b.get_pixel(x, y);
+            for ch in 0..3 {
+                acc += (p[ch] as i64 - q[ch] as i64).unsigned_abs();
+                n += 1;
+            }
+        }
+    }
+    acc as f64 / n.max(1) as f64
+}
+
+fn extract_frame(video: &PathBuf, t: f64, out: &PathBuf) {
+    let st = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            &format!("{t}"),
+            "-i",
+        ])
+        .arg(video.to_str().unwrap())
+        .args(["-frames:v", "1"])
+        .arg(out.to_str().unwrap())
+        .status()
+        .unwrap();
+    assert!(st.success());
+}
+
+/// regression for the PTS bug: a clip at offset>0 must show its *head*
+/// when its window opens — before the fix the input clock ran from t=0 so
+/// the clip was already `offset` seconds in (a 2s clip at offset 1.5
+/// appeared half-finished and froze at its tail).
+#[test]
+fn offset_clip_shows_head_at_offset() {
+    if !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    let dir = tmpdir("pts");
+    let (v, _a) = fixtures(&dir);
+    let out = dir.join("off.mp4");
+
+    let mut s = TlSession::new();
+    dispatch(
+        &mut s,
+        json!({"id": "tl.new", "w": 320, "h": 240, "fps": 24, "name": "o"}),
+    );
+    dispatch(&mut s, json!({"id": "tl.addTrack", "kind": "video"}));
+    // 2s testsrc2 parked at offset 1.5
+    dispatch(
+        &mut s,
+        json!({"id": "tl.addClip", "track": 0, "src": v.to_string_lossy(), "in": 0.0, "out": 2.0, "offset": 1.5}),
+    );
+    let rr = dispatch(
+        &mut s,
+        json!({"id": "tl.render", "out": out.to_string_lossy()}),
+    );
+    assert_eq!(rr["path"], json!(out.to_string_lossy()));
+
+    // before the window opens the frame must be black
+    let f_pre = dir.join("pre.png");
+    extract_frame(&out, 0.5, &f_pre);
+    let pre = image::open(&f_pre).unwrap().to_rgba8();
+    let lit = pre
+        .pixels()
+        .filter(|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 30)
+        .count();
+    assert_eq!(lit, 0, "pixels drawn before clip offset");
+
+    // just inside the window (t=1.6 ≈ clip-local 0.1) the output should
+    // match the SOURCE's t=0.1, not the source's t=1.6
+    let f_out = dir.join("at.png");
+    let f_src_head = dir.join("src0.png");
+    let f_src_late = dir.join("src16.png");
+    extract_frame(&out, 1.6, &f_out);
+    extract_frame(&v, 0.1, &f_src_head);
+    extract_frame(&v, 1.6, &f_src_late);
+    let o = image::open(&f_out).unwrap().to_rgba8();
+    let h_img = image::open(&f_src_head).unwrap().to_rgba8();
+    let l_img = image::open(&f_src_late).unwrap().to_rgba8();
+    let d_head = mad(&o, &h_img);
+    let d_late = mad(&o, &l_img);
+    assert!(
+        d_head < d_late,
+        "clip at offset should play from its head (head-diff {d_head:.1} vs late-diff {d_late:.1})"
+    );
+    // and not frozen on a stale frame later in the window either
+    let f_tail = dir.join("tail.png");
+    extract_frame(&out, 3.3, &f_tail);
+    let tail = image::open(&f_tail).unwrap().to_rgba8();
+    let lit2 = tail
+        .pixels()
+        .filter(|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 30)
+        .count();
+    assert!(lit2 > 1000, "clip vanished before its window ended");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// transition + volume expressions must parse under real ffmpeg — graph
+/// strings are unit-tested; this catches a filter-name/quoting slip.
+#[test]
+fn transitions_volume_and_duck_render_smoke() {
+    if !have("ffmpeg") || !have("ffprobe") {
+        return;
+    }
+    let dir = tmpdir("trans");
+    let (v, a) = fixtures(&dir);
+    let out = dir.join("t.mp4");
+
+    let mut s = TlSession::new();
+    dispatch(
+        &mut s,
+        json!({"id": "tl.new", "w": 320, "h": 240, "fps": 24, "name": "t"}),
+    );
+    dispatch(&mut s, json!({"id": "tl.addTrack", "kind": "video"}));
+    dispatch(
+        &mut s,
+        json!({
+            "id": "tl.addClip", "track": 0, "src": v.to_string_lossy(),
+            "in": 0.0, "out": 2.0, "offset": 0.5,
+            "transIn": {"type": "slide", "dur": 0.4},
+            "transOut": {"type": "dip", "dur": 0.3, "color": [0.0, 0.0, 0.0, 1.0]},
+            "volume": [[0.0, 1.0], [1.0, 0.5]],
+        }),
+    );
+    dispatch(&mut s, json!({"id": "tl.addTrack", "kind": "audio"}));
+    dispatch(
+        &mut s,
+        json!({"id": "tl.addClip", "track": 1, "src": a.to_string_lossy(), "in": 0.0, "out": 2.0, "offset": 0.0}),
+    );
+    dispatch(&mut s, json!({"id": "tl.addTrack", "kind": "subtitle"}));
+    dispatch(
+        &mut s,
+        json!({"id": "tl.addCue", "t": 0.5, "dur": 1.0, "text": "字幕"}),
+    );
+    let r = dispatch(&mut s, json!({"id": "tl.duck", "track": 1, "amount": 0.25}));
+    assert_eq!(r["dipped"], json!(1));
+    let rr = dispatch(
+        &mut s,
+        json!({"id": "tl.render", "out": out.to_string_lossy(), "burnSubs": true}),
+    );
+    assert_eq!(rr["path"], json!(out.to_string_lossy()));
+    assert_eq!(rr["audioStreams"], json!(1));
+    // dip underlay element is counted as a visual
+    assert_eq!(rr["clips"], json!(3));
+    assert!(out.exists() && out.metadata().unwrap().len() > 1000);
+    std::fs::remove_dir_all(&dir).ok();
 }
