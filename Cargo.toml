@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["cli", "composer"]
+members = ["cli", "composer", "motion", "pages"]
 
 [workspace.dependencies]
 # engine lives in araware — Koubou tracks its work branch; `cargo update -p
