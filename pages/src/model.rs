@@ -4,6 +4,7 @@
 //! downward (InDesign-style). PDF export flips to PDF's bottom-left space.
 //! Everything serializes camelCase for the control channel.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -20,6 +21,14 @@ pub struct PagesDoc {
     /// page margins in points (layout guides, not enforced)
     #[serde(default)]
     pub margins: Margins,
+    /// facing-pages mode: page indices >= 1 pair into verso/recto spreads
+    /// (view concern only — PDF stays one page per sheet)
+    #[serde(default)]
+    pub facing: bool,
+    /// named text styles (see `pg.setStyle` / `pg.applyStyle`); BTreeMap keeps
+    /// serialized order deterministic
+    #[serde(default)]
+    pub styles: BTreeMap<String, TextStyle>,
     #[serde(default)]
     pub pages: Vec<Page>,
     #[serde(default)]
@@ -41,6 +50,8 @@ impl PagesDoc {
             page_w,
             page_h,
             margins: Margins::default(),
+            facing: false,
+            styles: BTreeMap::new(),
             pages: Vec::new(),
             masters: Vec::new(),
             next_id: 1,
@@ -75,9 +86,18 @@ impl PagesDoc {
             anyhow::bail!("page {idx} out of range ({} pages)", self.pages.len());
         }
         let mut p = self.pages[idx].clone();
+        // remap ids so in-page `next` links follow the duplicates (a `next`
+        // pointing outside this page keeps its original target)
+        let mut remap: HashMap<u64, u64> = HashMap::with_capacity(p.frames.len());
         for f in p.frames.iter_mut() {
+            remap.insert(f.id, self.next_id);
             f.id = self.next_id;
             self.next_id += 1;
+        }
+        for f in p.frames.iter_mut() {
+            if let Some(n) = f.next {
+                f.next = Some(*remap.get(&n).unwrap_or(&n));
+            }
         }
         self.pages.insert(idx + 1, p);
         Ok(idx + 1)
@@ -131,6 +151,21 @@ impl PagesDoc {
     }
 
     /// find a frame by id across pages and masters
+    pub fn frame(&self, id: u64) -> Option<&Frame> {
+        for p in &self.pages {
+            if let Some(f) = p.frames.iter().find(|f| f.id == id) {
+                return Some(f);
+            }
+        }
+        for m in &self.masters {
+            if let Some(f) = m.frames.iter().find(|f| f.id == id) {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    /// find a frame by id across pages and masters
     pub fn frame_mut(&mut self, id: u64) -> Option<&mut Frame> {
         for p in &mut self.pages {
             if let Some(f) = p.frames.iter_mut().find(|f| f.id == id) {
@@ -181,6 +216,30 @@ impl PagesDoc {
         own.sort_by_key(|f| f.z);
         frames.extend(own);
         Ok(frames)
+    }
+
+    /// spread pairing of page indices for `pg.json` layout hints.
+    /// Facing off: every page alone. Facing on: page 0 alone (cover), then
+    /// verso/recto pairs — even index = left verso, odd = right recto.
+    pub fn spread_pairs(&self) -> Vec<Vec<usize>> {
+        let n = self.pages.len();
+        if !self.facing {
+            return (0..n).map(|i| vec![i]).collect();
+        }
+        let mut out: Vec<Vec<usize>> = Vec::new();
+        if n > 0 {
+            out.push(vec![0]);
+        }
+        let mut i = 1usize;
+        while i < n {
+            if i + 1 < n {
+                out.push(vec![i, i + 1]);
+            } else {
+                out.push(vec![i]);
+            }
+            i += 2;
+        }
+        out
     }
 
     pub fn to_json(&self) -> String {
@@ -273,6 +332,11 @@ pub struct Frame {
     /// stacking order; higher z paints later (on top)
     #[serde(default)]
     pub z: i32,
+    /// threaded text flow: when this text frame's content overflows its
+    /// height, the remainder continues into the frame with this id
+    /// (`pg.linkFrames` / `to:null` to unlink)
+    #[serde(default)]
+    pub next: Option<u64>,
     #[serde(flatten)]
     pub kind: FrameKind,
 }
@@ -287,6 +351,7 @@ impl Frame {
             h,
             rotation_deg: 0.0,
             z: 0,
+            next: None,
             kind,
         }
     }
@@ -327,6 +392,10 @@ pub enum FrameKind {
         /// line-height multiplier (1.0 = font's natural leading)
         #[serde(default = "default_leading")]
         leading: f32,
+        /// name of the last named style applied via `pg.applyStyle`
+        /// (bookkeeping only — props are copied, not referenced)
+        #[serde(default)]
+        style: String,
     },
     /// an image file placed into the frame
     Image {
@@ -344,6 +413,22 @@ pub enum FrameKind {
     /// straight line inside the frame box, from local (0,0) to (x2,y2) —
     /// (w,h) is a diagonal; (0,h)..(w,0) flips it. Rotation applies as usual.
     Line { x2: f32, y2: f32, stroke: Stroke },
+}
+
+/// a named text style (`pg.setStyle`): every field optional so a style can
+/// carry just a font, or a full spec. `pg.applyStyle` copies set fields onto
+/// a text frame.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TextStyle {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub font: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<[f32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leading: Option<f32>,
 }
 
 fn default_font_size() -> f32 {
@@ -451,6 +536,7 @@ mod tests {
                 color: [0.1, 0.2, 0.3, 1.0],
                 align: TextAlign::Center,
                 leading: 1.4,
+                style: String::new(),
             },
             36.0,
             36.0,
