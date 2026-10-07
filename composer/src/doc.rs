@@ -90,7 +90,9 @@ impl Document {
 
     /// move layer to a new stack index (0 = bottom)
     pub fn reorder(&mut self, id: u64, to: usize) -> bool {
-        let Some(i) = self.index_of(id) else { return false };
+        let Some(i) = self.index_of(id) else {
+            return false;
+        };
         let l = self.layers.remove(i);
         let to = to.min(self.layers.len());
         self.layers.insert(to, l);
@@ -110,7 +112,8 @@ impl Document {
     }
 
     pub fn load(path: &Path) -> Result<Document> {
-        let s = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let s =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Document::from_json(&s)
     }
 }
@@ -228,7 +231,10 @@ impl Layer {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum LayerKind {
     /// a source file (RAW or raster) developed live through the engine
-    Develop { path: PathBuf, recipe: Recipe },
+    Develop {
+        path: PathBuf,
+        recipe: Recipe,
+    },
     /// baked pixels
     Raster {
         width: u32,
@@ -236,12 +242,22 @@ pub enum LayerKind {
         src: RasterSrc,
     },
     /// tone/colour operations applied to the composite of everything below
-    Adjustment { recipe: Recipe },
-    Fill { fill: Fill },
-    Shape { shapes: Vec<Shape> },
-    Text { text: TextContent },
+    Adjustment {
+        recipe: Recipe,
+    },
+    Fill {
+        fill: Fill,
+    },
+    Shape {
+        shapes: Vec<Shape>,
+    },
+    Text {
+        text: TextContent,
+    },
     /// children composite into an isolated buffer, blended as one layer
-    Group { children: Vec<Layer> },
+    Group {
+        children: Vec<Layer>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,6 +368,9 @@ pub struct Stroke {
     pub color: [f32; 4],
     #[serde(default = "one_f")]
     pub width: f32,
+    /// SVG dasharray — alternating dash/gap lengths in px
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dash: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

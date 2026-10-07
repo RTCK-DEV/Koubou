@@ -201,9 +201,9 @@ impl Composer {
                 // doc size / scale (so a 1:1 photo layer renders full res)
                 let doc_max = self.doc.width.max(self.doc.height) as f32;
                 let need = (doc_max / layer.scale.max(0.01)).ceil() as u32;
-                self.engine.render(Path::new(path), recipe, need).map(|i| {
-                    LayerPixels::from_rgba8(i.width, i.height, &i.data)
-                })?
+                self.engine
+                    .render(Path::new(path), recipe, need)
+                    .map(|i| LayerPixels::from_rgba8(i.width, i.height, &i.data))?
             }
             LayerKind::Raster { width, height, src } => {
                 let (dw, dh, raw) = src.decode()?;
@@ -305,7 +305,10 @@ fn sample_bilinear(pix: &LayerPixels, x: f32, y: f32) -> [f32; 4] {
 fn mask_at(m: &Mask, x: f32, y: f32) -> f32 {
     let ix = x.floor().max(0.0) as u32;
     let iy = y.floor().max(0.0) as u32;
-    m.at(ix.min(m.width.saturating_sub(1)), iy.min(m.height.saturating_sub(1)))
+    m.at(
+        ix.min(m.width.saturating_sub(1)),
+        iy.min(m.height.saturating_sub(1)),
+    )
 }
 
 /// 3-pass box blur ≈ gaussian for mask feathering
@@ -375,8 +378,7 @@ fn rasterize_fill(fill: &Fill, w: u32, h: u32) -> LayerPixels {
             let len2 = (dx * dx + dy * dy).max(1e-6);
             for y in 0..h {
                 for x in 0..w {
-                    let t = (((x as f32 / w as f32) - x0) * dx
-                        + ((y as f32 / h as f32) - y0) * dy)
+                    let t = (((x as f32 / w as f32) - x0) * dx + ((y as f32 / h as f32) - y0) * dy)
                         / len2;
                     p.data[(y * w + x) as usize] = grad_at(stops, t);
                 }
@@ -397,7 +399,11 @@ fn grad_at(stops: &[[f32; 5]], t: f32) -> [f32; 4] {
         return [a[1], a[2], a[3], a[4]];
     }
     let b = stops[i + 1];
-    let f = if b[0] > a[0] { (t - a[0]) / (b[0] - a[0]) } else { 0.0 };
+    let f = if b[0] > a[0] {
+        (t - a[0]) / (b[0] - a[0])
+    } else {
+        0.0
+    };
     [
         a[1] + (b[1] - a[1]) * f,
         a[2] + (b[2] - a[2]) * f,

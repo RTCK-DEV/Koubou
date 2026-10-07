@@ -49,8 +49,7 @@ pub fn import_psd(path: &Path) -> Result<Document> {
         l.opacity = (pl.opacity() as f32 / 255.0).clamp(0.0, 1.0);
         // psd 0.3 keeps its BlendMode enum in a private module — map via its
         // Debug name through our own parser
-        l.blend = BlendMode::parse(&format!("{:?}", pl.blend_mode()))
-            .unwrap_or(BlendMode::Normal);
+        l.blend = BlendMode::parse(&format!("{:?}", pl.blend_mode())).unwrap_or(BlendMode::Normal);
         doc.add_layer(l);
     }
     Ok(doc)

@@ -55,14 +55,22 @@ fn alpha_compositing() {
 fn doc_json_roundtrip() {
     let mut d = Document::new("t", 64, 48);
     d.backdrop = [1.0, 1.0, 1.0, 1.0];
-    let mut l = Layer::fill("bg", Fill::Solid { color: [1.0, 0.0, 0.0, 1.0] });
+    let mut l = Layer::fill(
+        "bg",
+        Fill::Solid {
+            color: [1.0, 0.0, 0.0, 1.0],
+        },
+    );
     l.mask = Some(Mask::full(4, 4));
     let id = d.add_layer(l);
-    let mut t = Layer::text("title", TextContent {
-        text: "hello".into(),
-        size: 20.0,
-        ..Default::default()
-    });
+    let mut t = Layer::text(
+        "title",
+        TextContent {
+            text: "hello".into(),
+            size: 20.0,
+            ..Default::default()
+        },
+    );
     t.blend = BlendMode::Screen;
     d.add_layer(t);
     let s = d.to_json();
@@ -76,15 +84,17 @@ fn doc_json_roundtrip() {
 #[test]
 fn composite_fill_plus_gradient() {
     let mut d = Document::new("t", 8, 8);
-    d.add_layer(Layer::fill("base", Fill::Solid { color: [0.0, 0.0, 1.0, 1.0] }));
+    d.add_layer(Layer::fill(
+        "base",
+        Fill::Solid {
+            color: [0.0, 0.0, 1.0, 1.0],
+        },
+    ));
     let mut g = Layer::fill(
         "g",
         Fill::LinearGradient {
             line: [0.0, 0.0, 1.0, 0.0],
-            stops: vec![
-                [0.0, 1.0, 0.0, 0.0, 1.0],
-                [1.0, 0.0, 1.0, 0.0, 1.0],
-            ],
+            stops: vec![[0.0, 1.0, 0.0, 0.0, 1.0], [1.0, 0.0, 1.0, 0.0, 1.0]],
         },
     );
     g.blend = BlendMode::Screen;
@@ -103,7 +113,12 @@ fn composite_fill_plus_gradient() {
 #[test]
 fn adjustment_layer_darkens_below() {
     let mut d = Document::new("t", 8, 8);
-    d.add_layer(Layer::fill("base", Fill::Solid { color: [0.8, 0.8, 0.8, 1.0] }));
+    d.add_layer(Layer::fill(
+        "base",
+        Fill::Solid {
+            color: [0.8, 0.8, 0.8, 1.0],
+        },
+    ));
     let mut r = Recipe::default();
     r.exposure = -1.0; // -1 EV
     d.add_layer(Layer::adjustment("ev-1", r));
@@ -123,8 +138,18 @@ fn adjustment_layer_darkens_below() {
 #[test]
 fn mask_hides_area() {
     let mut d = Document::new("t", 4, 1);
-    d.add_layer(Layer::fill("base", Fill::Solid { color: [0.0, 0.0, 0.0, 1.0] }));
-    let mut top = Layer::fill("top", Fill::Solid { color: [1.0, 1.0, 1.0, 1.0] });
+    d.add_layer(Layer::fill(
+        "base",
+        Fill::Solid {
+            color: [0.0, 0.0, 0.0, 1.0],
+        },
+    ));
+    let mut top = Layer::fill(
+        "top",
+        Fill::Solid {
+            color: [1.0, 1.0, 1.0, 1.0],
+        },
+    );
     let mut m = Mask::full(4, 1);
     m.data[0] = 0.0;
     m.data[1] = 0.0; // hide left half of top layer
@@ -139,14 +164,19 @@ fn mask_hides_area() {
 #[test]
 fn shape_circle_renders() {
     let mut d = Document::new("t", 100, 100);
-    d.add_layer(Layer::fill("base", Fill::Solid { color: [0.0, 0.0, 0.0, 1.0] }));
+    d.add_layer(Layer::fill(
+        "base",
+        Fill::Solid {
+            color: [0.0, 0.0, 0.0, 1.0],
+        },
+    ));
     let mut s = Layer::shape(
         "dot",
         vec![Shape {
             // circle r=30 centered 50,50 via two arcs -> approximate with bezier circle
             d: "M 80 50 C 80 66.6 66.6 80 50 80 C 33.4 80 20 66.6 20 50 C 20 33.4 33.4 20 50 20 C 66.6 20 80 33.4 80 50 Z".into(),
             fill: Some([1.0, 0.0, 0.0, 1.0]),
-            stroke: Some(Stroke { color: [0.0, 1.0, 0.0, 1.0], width: 2.0 }),
+            stroke: Some(Stroke { color: [0.0, 1.0, 0.0, 1.0], width: 2.0, dash: None }),
         }],
     );
     s.gen = 1;
@@ -160,9 +190,59 @@ fn shape_circle_renders() {
 }
 
 #[test]
+fn gen_paths_produce_shapes() {
+    // vectorcraft share: gen names must emit a usable `d`
+    let rect = koubou_composer::shape::gen_path(&serde_json::json!({
+        "gen": "rect", "x": 10, "y": 10, "w": 40, "h": 30
+    }));
+    assert!(rect.unwrap().starts_with('M'));
+    let star = koubou_composer::shape::gen_path(&serde_json::json!({
+        "gen": "star", "cx": 50, "cy": 50, "r": 40, "points": 5, "innerRatio": 0.5
+    }));
+    assert!(star.unwrap().contains('L'));
+    let bad = koubou_composer::shape::gen_path(&serde_json::json!({"gen": "nope"}));
+    assert!(bad.is_none());
+}
+
+#[test]
+fn dashed_stroke_renders() {
+    // a dashed stroke must leave gaps — not crash, not a solid ring
+    let mut d = Document::new("t", 100, 20);
+    d.add_layer(Layer::fill(
+        "base",
+        Fill::Solid {
+            color: [0.0, 0.0, 0.0, 1.0],
+        },
+    ));
+    let s = Layer::shape(
+        "dash",
+        vec![Shape {
+            d: "M 0 10 L 100 10".into(),
+            fill: None,
+            stroke: Some(Stroke {
+                color: [1.0, 1.0, 1.0, 1.0],
+                width: 2.0,
+                dash: Some(vec![6.0, 6.0]),
+            }),
+        }],
+    );
+    d.add_layer(s);
+    let mut c = Composer::new(d).unwrap();
+    let img = c.render().unwrap();
+    let lit = img.data.chunks(4).filter(|p| p[0] > 100).count();
+    // solid stroke would paint ~all of 2000 px along the line; dashed ~half
+    assert!(lit > 10 && lit < 1600, "dashed stroke lit px: {lit}");
+}
+
+#[test]
 fn text_renders_nonempty() {
     let mut d = Document::new("t", 400, 120);
-    d.add_layer(Layer::fill("base", Fill::Solid { color: [0.0, 0.0, 0.0, 1.0] }));
+    d.add_layer(Layer::fill(
+        "base",
+        Fill::Solid {
+            color: [0.0, 0.0, 0.0, 1.0],
+        },
+    ));
     let mut t = Layer::text(
         "title",
         TextContent {

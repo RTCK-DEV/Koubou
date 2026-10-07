@@ -8,9 +8,9 @@ struct KouApp: App {
 
     var body: some Scene {
         WindowGroup("koubou") {
-            LibraryView()
+            StudioView()
                 .environmentObject(store)
-                .frame(minWidth: 1080, minHeight: 660)
+                .frame(minWidth: 1120, minHeight: 700)
         }
         .windowToolbarStyle(.unifiedCompact)
         .commands {
@@ -22,7 +22,61 @@ struct KouApp: App {
                     .keyboardShortcut("n", modifiers: .command)
                 Button("Open Document…") { store.openDocument() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("Import PDF as Document…") { store.doc.importPdf() }
+                Divider()
+                Button("New Timeline") { store.mode = .motion }
+                Button("New Pages Doc") { store.mode = .pages }
             }
+        }
+    }
+}
+
+/// Workspace modes — one window, every craft domain.
+enum StudioMode: String, CaseIterable {
+    case library = "Library"
+    case doc = "Layers"
+    case motion = "Motion"
+    case pages = "Pages"
+}
+
+struct StudioView: View {
+    @EnvironmentObject var store: LibraryStore
+
+    var body: some View {
+        VStack(spacing: 0) {
+            modeBar
+            Divider()
+            content
+        }
+        .background(Kou.bg0)
+    }
+
+    private var modeBar: some View {
+        HStack(spacing: 4) {
+            ForEach(StudioMode.allCases, id: \.self) { m in
+                Button {
+                    store.mode = m
+                } label: {
+                    Text(m.rawValue)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .padding(.horizontal, 12).padding(.vertical, 5)
+                        .background(
+                            Capsule().fill(store.mode == m ? Kou.accent.opacity(0.9) : Color.clear))
+                        .foregroundStyle(store.mode == m ? .black : .secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+    }
+
+    @ViewBuilder private var content: some View {
+        switch store.mode {
+        case .library: LibraryView()
+        case .doc: DocEditorView(doc: store.doc) { store.mode = .library }
+        case .motion: MotionView()
+        case .pages: PagesView()
         }
     }
 }
@@ -33,7 +87,21 @@ final class LibraryStore: ObservableObject {
     @Published var selection: Photo?
     /// layered-document workspace (koubou-composer session)
     let doc = DocStore()
-    @Published var editingDoc = false
+    /// video timeline workspace (koubou-motion session)
+    let motion = MotionStore()
+    /// page-layout workspace (koubou-pages session)
+    let pages = PagesStore()
+    /// active workspace
+    @Published var mode: StudioMode = .library {
+        didSet {
+            // entering a workspace lazily creates its document
+            if mode == .motion && !motion.opened { motion.newTimeline() }
+            if mode == .pages && !pages.opened { pages.newDoc() }
+        }
+    }
+    @Published var editingDoc = false {
+        didSet { if editingDoc { mode = .doc } }
+    }
     @Published var scanning = false
     @Published var minRating = 0
     @Published var labelFilter = ""
@@ -129,7 +197,7 @@ final class LibraryStore: ObservableObject {
     /// Promote the selected photo into a layered document and switch views.
     func editAsDocument() {
         guard let p = selection else { return }
-        editingDoc = true
+        mode = .doc
         doc.fromPhoto(p.path)
     }
 
@@ -141,12 +209,12 @@ final class LibraryStore: ObservableObject {
             p.allowedContentTypes = [t, UTType(filenameExtension: "psd") ?? .data]
         }
         guard p.runModal() == .OK, let url = p.url else { return }
-        editingDoc = true
+        mode = .doc
         doc.open(url)
     }
 
     func newDocument() {
-        editingDoc = true
+        mode = .doc
         doc.newDoc()
     }
 }

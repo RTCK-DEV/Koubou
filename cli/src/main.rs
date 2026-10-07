@@ -34,16 +34,18 @@ fn main() -> Result<()> {
     let cmd = args[1].as_str();
     match cmd {
         // ---- single-shot file ops (araware-compatible CLI surface) ----
-        "render" | "thumb" | "reference" | "scan" | "meta" | "auto" | "rate" => {
-            file_cmd(&args)
-        }
+        "render" | "thumb" | "reference" | "scan" | "meta" | "auto" | "rate" => file_cmd(&args),
         "doc" => {
             let inp = args.get(2).context("doc path")?;
             let out = args.get(3).map(String::as_str).unwrap_or("doc.png");
             let max: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             let d = koubou_composer::Document::load(Path::new(inp))?;
             let mut c = Composer::new(d)?;
-            let img = if max > 0 { c.render_preview(max)? } else { c.render()? };
+            let img = if max > 0 {
+                c.render_preview(max)?
+            } else {
+                c.render()?
+            };
             image::RgbaImage::from_raw(img.width, img.height, img.data)
                 .context("buffer")?
                 .save(out)?;
@@ -52,10 +54,7 @@ fn main() -> Result<()> {
         }
         "psd" => {
             let inp = args.get(2).context("psd path")?;
-            let out = args
-                .get(3)
-                .map(String::as_str)
-                .unwrap_or("doc.koubou");
+            let out = args.get(3).map(String::as_str).unwrap_or("doc.koubou");
             let d = koubou_composer::psd::import_psd(Path::new(inp))?;
             d.save(Path::new(out))?;
             println!("{out} ({} layers)", d.layers.len());
@@ -75,10 +74,8 @@ fn file_cmd(args: &[String]) -> Result<()> {
             let path = args.get(2).context("img")?;
             let out = args.get(3).map(String::as_str).unwrap_or("out.png");
             let recipe_v: Value = match args.get(4) {
-                Some(p) => serde_json::from_str(
-                    &std::fs::read_to_string(p).context("recipe")?,
-                )
-                .context("recipe json")?,
+                Some(p) => serde_json::from_str(&std::fs::read_to_string(p).context("recipe")?)
+                    .context("recipe json")?,
                 None => Value::Null,
             };
             let max: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -244,7 +241,10 @@ fn mcp() -> Result<()> {
                 let args = req["params"]["arguments"].clone();
                 let mut call = args;
                 call["id"] = Value::String(name.to_string());
-                let r = session.lock().unwrap_or_else(|e| e.into_inner()).dispatch(&call);
+                let r = session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .dispatch(&call);
                 let text = serde_json::to_string_pretty(&r).unwrap();
                 if r["ok"] == true {
                     json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": text}]}})
@@ -300,5 +300,35 @@ fn mcp_tools() -> Value {
         tool("doc.maskPaint", "Paint a soft dab into a layer mask", json!({"layer": n("layer id"), "cx": n("x"), "cy": n("y"), "r": n("radius px"), "value": n("0-1 coverage"), "softness": n("0-1")}), &["layer", "cx", "cy"]),
         tool("doc.render", "Composite the open document to PNG", json!({"out": s("output path"), "maxPx": n("preview size, 0=full")}), &["out"]),
         tool("doc.save", "Save the open document as .koubou", json!({"path": s("doc path")}), &["path"]),
+        tool("doc.addShape", "Append a shape to a shape layer (gen: rect|roundRect|ellipse|star|line, or d)", json!({"layer": n("layer id"), "gen": s("shape generator"), "d": s("svg path")}), &["layer"]),
+        tool("doc.shapeSet", "Edit one shape on a shape layer by index", json!({"layer": n("layer id"), "index": n("shape index")}), &["layer", "index"]),
+        tool("doc.shapeRemove", "Remove one shape from a shape layer by index", json!({"layer": n("layer id"), "index": n("shape index")}), &["layer", "index"]),
+        // motion domain
+        tool("tl.new", "Create a new video timeline", json!({"w": n("px"), "h": n("px"), "fps": n("frames/sec"), "name": s("name")}), &[]),
+        tool("tl.open", "Open a .kmotion timeline", json!({"path": s("timeline path")}), &["path"]),
+        tool("tl.save", "Save the timeline as .kmotion", json!({"path": s("path")}), &["path"]),
+        tool("tl.json", "Return the timeline's JSON state", json!({}), &[]),
+        tool("tl.addTrack", "Add a track (kind: video|audio|subtitle)", json!({"kind": s("track kind")}), &["kind"]),
+        tool("tl.addClip", "Add a clip to a track", json!({"track": n("track index"), "src": s("media path"), "in": n("source in sec"), "out": n("source out sec"), "offset": n("timeline offset sec")}), &["track", "src"]),
+        tool("tl.setClip", "Edit a clip (clip=id + in/out/offset/opacity/scale/fadeIn/fadeOut)", json!({"clip": n("clip id")}), &["clip"]),
+        tool("tl.removeClip", "Remove a clip", json!({"clip": n("clip id")}), &["clip"]),
+        tool("tl.addCue", "Append a subtitle cue", json!({"t": n("sec"), "dur": n("sec"), "text": s("cue text")}), &["t", "text"]),
+        tool("tl.probe", "ffprobe a media file", json!({"path": s("media path")}), &["path"]),
+        tool("tl.renderFrame", "Render one frame at t seconds to PNG", json!({"t": n("sec"), "out": s("output path")}), &["t"]),
+        tool("tl.render", "Render the timeline to mp4 via ffmpeg", json!({"out": s("output path")}), &["out"]),
+        tool("tl.detectSilence", "ffmpeg silencedetect on a media file", json!({"path": s("media path")}), &["path"]),
+        tool("tl.generateClip", "Generate a clip with the h3ui/minimax backend and add it", json!({"endpoint": s("h3ui base URL"), "prompt": s("generation prompt")}), &["prompt"]),
+        // pages domain
+        tool("pg.new", "Create a new pages document", json!({"name": s("name"), "pageW": n("pt"), "pageH": n("pt")}), &[]),
+        tool("pg.open", "Open a .kpages document", json!({"path": s("doc path")}), &["path"]),
+        tool("pg.save", "Save the pages document", json!({"path": s("path")}), &["path"]),
+        tool("pg.json", "Return the pages document's JSON state", json!({}), &[]),
+        tool("pg.addPage", "Append a page", json!({}), &[]),
+        tool("pg.removePage", "Remove a page", json!({"page": n("index")}), &["page"]),
+        tool("pg.addFrame", "Add a frame (kind: text|image|rect|line)", json!({"page": n("index"), "kind": s("frame kind"), "x": n("pt"), "y": n("pt"), "w": n("pt"), "h": n("pt")}), &["page", "kind"]),
+        tool("pg.setFrame", "Edit a frame by id", json!({"page": n("index"), "frame": n("frame id")}), &["page", "frame"]),
+        tool("pg.removeFrame", "Remove a frame", json!({"page": n("index"), "frame": n("frame id")}), &["page", "frame"]),
+        tool("pg.render", "Export the document to PDF", json!({"out": s("output path")}), &["out"]),
+        tool("pg.renderPng", "Render a page to PNG", json!({"page": n("index"), "out": s("output path"), "maxPx": n("size")}), &["page"]),
     ])
 }

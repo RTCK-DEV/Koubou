@@ -18,10 +18,14 @@ use crate::blend::BlendMode;
 use crate::composite::Composer;
 use crate::doc::{Document, Fill, Layer, LayerKind, Mask, Shape, Stroke, TextAlign, TextContent};
 
-/// one app session: an imaging engine plus an optional open document
+/// one app session: an imaging engine plus an optional open document,
+/// an optional motion timeline and an optional pages layout. `tl.*` and
+/// `pg.*` ids are delegated to those crates — one Session, every domain.
 pub struct Session {
     engine: Engine,
     pub composer: Option<Composer>,
+    motion: Option<koubou_motion::TlSession>,
+    pages: Option<koubou_pages::PgSession>,
 }
 
 impl Session {
@@ -29,11 +33,36 @@ impl Session {
         Ok(Session {
             engine: Engine::new()?,
             composer: None,
+            motion: None,
+            pages: None,
         })
     }
 
     pub fn dispatch(&mut self, v: &Value) -> Value {
         let id = v.get("id").and_then(Value::as_str).unwrap_or("");
+        // domain routing: tl.* → motion timeline session, pg.* → pages
+        // session. Their dispatch(id, v) -> Result<Value> mirrors run();
+        // same never-crash guard + envelope at this edge.
+        if id.starts_with("tl.") {
+            let s = self
+                .motion
+                .get_or_insert_with(koubou_motion::TlSession::new);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.dispatch(id, v)));
+            return match r {
+                Ok(Ok(result)) => json!({"ok": true, "result": result}),
+                Ok(Err(e)) => json!({"ok": false, "error": format!("{e:#}")}),
+                Err(_) => json!({"ok": false, "error": format!("command '{id}' panicked")}),
+            };
+        }
+        if id.starts_with("pg.") {
+            let s = self.pages.get_or_insert_with(koubou_pages::PgSession::new);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.dispatch(id, v)));
+            return match r {
+                Ok(Ok(result)) => json!({"ok": true, "result": result}),
+                Ok(Err(e)) => json!({"ok": false, "error": format!("{e:#}")}),
+                Err(_) => json!({"ok": false, "error": format!("command '{id}' panicked")}),
+            };
+        }
         // never-crash guard: a panicking command becomes an error, not a dead session
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run(id, v)));
         match r {
@@ -68,7 +97,38 @@ impl Session {
             "doc.removeLayer",
             "doc.reorder",
             "doc.render",
+            "doc.addShape",
+            "doc.shapeSet",
+            "doc.shapeRemove",
             "doc.maskPaint",
+            // motion domain (koubou-motion / .kmotion)
+            "tl.new",
+            "tl.open",
+            "tl.save",
+            "tl.json",
+            "tl.addTrack",
+            "tl.addClip",
+            "tl.setClip",
+            "tl.removeClip",
+            "tl.addCue",
+            "tl.probe",
+            "tl.renderFrame",
+            "tl.render",
+            "tl.detectSilence",
+            "tl.generateClip",
+            // pages domain (koubou-pages / .kpages)
+            "pg.new",
+            "pg.open",
+            "pg.save",
+            "pg.json",
+            "pg.addPage",
+            "pg.removePage",
+            "pg.addFrame",
+            "pg.setFrame",
+            "pg.removeFrame",
+            "pg.setMaster",
+            "pg.render",
+            "pg.renderPng",
         ]
     }
 
@@ -142,13 +202,18 @@ impl Session {
                 // raster dims may be absent on older araware-core — fall back
                 // to reading the file header directly.
                 let dims = || -> Result<(u64, u64)> {
-                    image::image_dimensions(&path).map_err(anyhow::Error::from)
+                    image::image_dimensions(&path)
+                        .map_err(anyhow::Error::from)
                         .map(|(w, h)| (w as u64, h as u64))
                 };
-                let w = meta["width"].as_u64()
-                    .or_else(|| dims().ok().map(|d| d.0)).context("meta width")? as u32;
-                let h = meta["height"].as_u64()
-                    .or_else(|| dims().ok().map(|d| d.1)).context("meta height")? as u32;
+                let w = meta["width"]
+                    .as_u64()
+                    .or_else(|| dims().ok().map(|d| d.0))
+                    .context("meta width")? as u32;
+                let h = meta["height"]
+                    .as_u64()
+                    .or_else(|| dims().ok().map(|d| d.1))
+                    .context("meta height")? as u32;
                 self.composer = Some(Composer::new(Document::from_photo(&path, w, h))?);
                 Ok(json!({"w": w, "h": h}))
             }
@@ -218,6 +283,82 @@ impl Session {
                 let c = self.composer.as_mut().context("no document")?;
                 mask_paint(&mut c.doc, v)
             }
+            "doc.addShape" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let l = c.doc.layer_mut(id).context("layer not found")?;
+                let shapes = match &mut l.kind {
+                    LayerKind::Shape { shapes } => shapes,
+                    _ => anyhow::bail!("layer {id} is not a shape layer"),
+                };
+                let d = v
+                    .get("d")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| crate::shape::gen_path(v))
+                    .context("need 'd' or 'gen'")?;
+                let fill = v
+                    .get("fill")
+                    .and_then(|c| serde_json::from_value::<[f32; 4]>(c.clone()).ok());
+                let stroke = v
+                    .get("stroke")
+                    .and_then(|c| serde_json::from_value::<Stroke>(c.clone()).ok());
+                shapes.push(Shape { d, fill, stroke });
+                let ix = shapes.len() - 1;
+                l.gen += 1;
+                Ok(json!({"index": ix}))
+            }
+            "doc.shapeSet" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let ix = v.get("index").and_then(Value::as_u64).context("index")? as usize;
+                let l = c.doc.layer_mut(id).context("layer not found")?;
+                let shapes = match &mut l.kind {
+                    LayerKind::Shape { shapes } => shapes,
+                    _ => anyhow::bail!("layer {id} is not a shape layer"),
+                };
+                let s = shapes.get_mut(ix).with_context(|| format!("shape {ix}"))?;
+                if let Some(d) = v.get("d").and_then(Value::as_str) {
+                    s.d = d.to_string();
+                } else if let Some(d) = crate::shape::gen_path(v) {
+                    s.d = d;
+                }
+                if v.get("removeFill")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    s.fill = None;
+                } else if let Some(f) = v.get("fill") {
+                    s.fill = serde_json::from_value(f.clone()).ok();
+                }
+                if v.get("removeStroke")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    s.stroke = None;
+                } else if let Some(st) = v.get("stroke") {
+                    s.stroke = serde_json::from_value(st.clone()).ok();
+                }
+                l.gen += 1;
+                Ok(json!("ok"))
+            }
+            "doc.shapeRemove" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let ix = v.get("index").and_then(Value::as_u64).context("index")? as usize;
+                let l = c.doc.layer_mut(id).context("layer not found")?;
+                match &mut l.kind {
+                    LayerKind::Shape { shapes } => {
+                        if ix >= shapes.len() {
+                            anyhow::bail!("shape {ix} out of range");
+                        }
+                        shapes.remove(ix);
+                    }
+                    _ => anyhow::bail!("layer {id} is not a shape layer"),
+                }
+                l.gen += 1;
+                Ok(json!("ok"))
+            }
             _ => anyhow::bail!("unknown command id: {id}"),
         }
     }
@@ -240,8 +381,9 @@ fn recipe_arg(v: &Value) -> Result<Recipe> {
     match v.get("recipe") {
         None => Ok(Recipe::default()),
         Some(Value::Null) => Ok(Recipe::default()),
-        Some(r) if r.is_string() => Recipe::from_json(r.as_str().unwrap())
-            .context("invalid recipe JSON"),
+        Some(r) if r.is_string() => {
+            Recipe::from_json(r.as_str().unwrap()).context("invalid recipe JSON")
+        }
         Some(r) => serde_json::from_value(r.clone()).map_err(Into::into),
     }
 }
@@ -334,18 +476,19 @@ fn layer_from(v: &Value) -> Result<Layer> {
         }
         "shape" => {
             let mut shapes: Vec<Shape> = Vec::new();
-            if let Some(d) = v.get("d").and_then(Value::as_str) {
+            let d_str = v
+                .get("d")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| crate::shape::gen_path(v));
+            if let Some(d) = d_str {
                 let fill = v
                     .get("fill")
                     .and_then(|c| serde_json::from_value::<[f32; 4]>(c.clone()).ok());
                 let stroke = v
                     .get("stroke")
                     .and_then(|c| serde_json::from_value::<Stroke>(c.clone()).ok());
-                shapes.push(Shape {
-                    d: d.to_string(),
-                    fill,
-                    stroke,
-                });
+                shapes.push(Shape { d, fill, stroke });
             }
             if let Some(arr) = v.get("shapes") {
                 shapes = serde_json::from_value(arr.clone()).context("shapes")?;
@@ -421,7 +564,9 @@ fn layer_id(v: &Value) -> Result<u64> {
 
 /// doc.setLayer params — all optional
 fn set_layer(doc: &mut Document, id: u64, v: &Value) -> Result<Value> {
-    let l = doc.layer_mut(id).with_context(|| format!("layer {id} not found"))?;
+    let l = doc
+        .layer_mut(id)
+        .with_context(|| format!("layer {id} not found"))?;
     if let Some(n) = v.get("name").and_then(Value::as_str) {
         l.name = n.to_string();
     }
@@ -505,16 +650,24 @@ fn mask_paint(doc: &mut Document, v: &Value) -> Result<Value> {
     let val = v.get("value").and_then(Value::as_f64).unwrap_or(0.0) as f32;
     let soft = v.get("softness").and_then(Value::as_f64).unwrap_or(0.5) as f32;
     let (w, h) = match doc.layer(id) {
-        Some(Layer { kind: LayerKind::Adjustment { .. }, .. }) | None => {
-            (doc.width, doc.height)
-        }
+        Some(Layer {
+            kind: LayerKind::Adjustment { .. },
+            ..
+        })
+        | None => (doc.width, doc.height),
         Some(_l) => (doc.width, doc.height), // masks live in layer space = doc space for now
     };
     let l = doc.layer_mut(id).context("layer not found")?;
     let m = l.mask.get_or_insert_with(|| Mask::full(w, h));
     let r2 = r * r;
-    let (x0, x1) = ((cx - r - 1.0).max(0.0) as u32, ((cx + r + 1.0) as u32).min(m.width));
-    let (y0, y1) = ((cy - r - 1.0).max(0.0) as u32, ((cy + r + 1.0) as u32).min(m.height));
+    let (x0, x1) = (
+        (cx - r - 1.0).max(0.0) as u32,
+        ((cx + r + 1.0) as u32).min(m.width),
+    );
+    let (y0, y1) = (
+        (cy - r - 1.0).max(0.0) as u32,
+        ((cy + r + 1.0) as u32).min(m.height),
+    );
     for y in y0..y1.min(m.height) {
         for x in x0..x1.min(m.width) {
             let dx = x as f32 - cx;

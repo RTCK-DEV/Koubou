@@ -6,6 +6,8 @@ description = "koubou layered document engine: layers, masks, blend modes, vecto
 
 [dependencies]
 koubou-core.workspace = true
+koubou-motion = { path = "../motion" }
+koubou-pages = { path = "../pages" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

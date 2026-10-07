@@ -83,9 +83,7 @@ struct LibraryView: View {
                 }
             }
         } detail: {
-            if store.editingDoc {
-                DocEditorView(doc: store.doc) { store.editingDoc = false }
-            } else if let photo = store.selection {
+            if let photo = store.selection {
                 EditorView(photo: photo)
                     .id(photo.id)
             } else {

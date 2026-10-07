@@ -56,7 +56,8 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | Develop layers (live RAW develop inside stack) | ✅ | `doc.addLayer kind=develop` |
 | Adjustment layers (full recipe over the stack below) | ✅ | `doc.addLayer kind=adjustment` |
 | Fill layers (solid/linear gradient) | ✅ | `doc.addLayer kind=fill/gradient` |
-| Shape layers (SVG path, fill+stroke) | ✅ | `doc.addLayer kind=shape` |
+| Shape layers (SVG path, fill+stroke, dash) | ✅ | `doc.addLayer kind=shape` |
+| Shape generators (rect/roundRect/ellipse/star/line) + edit/remove | ✅ | `cmd:doc.addShape`, `doc.shapeSet`, `doc.shapeRemove` |
 | Text layers (font, size, tracking, leading, align, wrap) | ✅ | `doc.addLayer kind=text` |
 | Group layers (isolated composite) | 🟡 | engine ✅; UI nesting ❌ |
 | Raster layers (embedded PNG / file link) | ✅ | `doc.addLayer kind=raster/rasterFile` |
@@ -97,7 +98,48 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 6. Group nesting in the UI
 7. PSD export
 
-## Out of scope (v1, deliberate)
+## Vector / design (vectorcraft)
 
-Video editing, print/PDF layout, page composition, 3D — the craft suite's
-other domains are separate products, not Koubou's job.
+| feature | status | command / note |
+|---|---|---|
+| Shape layers with SVG `d` paths | ✅ | `doc.addLayer kind=shape` |
+| Parametric generators + dash strokes | ✅ | `cmd:doc.addShape`, `doc.shapeSet`, `doc.shapeRemove` |
+| Boolean ops, path editor, node tools | ❌ | — |
+| SVG import/export, artboards | ❌ | — |
+
+## Motion / effects (filmcraft + effectcraft)
+
+| feature | status | command / note |
+|---|---|---|
+| Timeline model (.kmotion): tracks, clips, cues | ✅ | `cmd:tl.new`, `tl.open`, `tl.save`, `tl.json`, `tl.addTrack` |
+| Clip edit (in/out/offset, keyframed opacity/scale/x/y, fades) | ✅ | `tl.addClip`, `tl.setClip`, `tl.removeClip` |
+| Subtitles (cues) + SRT burn-in | ✅ | `tl.addCue` |
+| Frame preview + mp4 export via ffmpeg | ✅ | `tl.renderFrame`, `tl.render` |
+| Silence detection, media probe | ✅ | `tl.detectSilence`, `tl.probe` |
+| Generative clip insert (minimax-h3 endpoint) | ✅ | `tl.generateClip` |
+| Speech-to-subtitle (Speech framework) | ✅ | app (SFSpeechRecognizer → `tl.addCue`) |
+| Audio ducking/EQ/comp per clip | 🟡 | ffmpeg af params; no UI yet |
+| Transitions beyond fade, speed ramp, multicam | ❌ | — |
+| GPU realtime playback | ❌ | frame-by-frame only |
+
+## Pages / layout (designcraft)
+
+| feature | status | command / note |
+|---|---|---|
+| Multi-page doc (.kpages), masters | ✅ | `cmd:pg.new`, `pg.open`, `pg.save`, `pg.addPage`, `pg.setMaster` |
+| Frames: text/image/rect/line, rotation | ✅ | `pg.addFrame`, `pg.setFrame`, `pg.removeFrame` |
+| PDF export (PDF 1.4, Helvetica+JPEG+vectors) | ✅ | `pg.render` |
+| Page PNG preview | ✅ | `pg.renderPng` |
+| Text flow/threading, facing pages, bleed | ❌ | — |
+| Character/paragraph styles, hyphenation | ❌ | — |
+
+## Print / PDF (printcraft)
+
+| feature | status | command / note |
+|---|---|---|
+| PDF import → raster layers per page | ✅ | app Import PDF (PDFKit → `doc.addLayer kind=raster`) |
+| PDF export from pages domain | ✅ | `pg.render` |
+| PDF annotation forms/sign/preflight | ❌ | — |
+| Imposition, color management for print | ❌ | — |
+
+## Automation surfaces

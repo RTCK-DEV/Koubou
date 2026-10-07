@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import PDFKit
 
 // MARK: - Document store
 
@@ -305,6 +306,93 @@ final class DocStore: ObservableObject {
                  then: .none)
         reloadImageSoon()
     }
+
+    // ---- vector (vectorcraft) ----
+
+    /// Append a generated shape (rect|roundRect|ellipse|star|line) to the
+    /// selected shape layer — or make a shape layer first if needed.
+    func addGenShape(_ gen: String) {
+        let run: () -> Void = { [weak self] in
+            guard let self, let id = self.selected,
+                  self.selLayer?.kind == "shape" else { return }
+            let params: [String: Any]
+            switch gen {
+            case "star": params = ["gen": "star", "cx": self.docW / 2,
+                                   "cy": self.docH / 2, "r": self.docH / 4,
+                                   "points": 5, "innerRatio": 0.45]
+            case "line": params = ["gen": "line", "x0": self.docW / 4,
+                                   "y0": self.docH / 2, "x1": self.docW * 3 / 4,
+                                   "y1": self.docH / 2]
+            default: params = ["gen": gen, "x": self.docW / 4, "y": self.docH / 4,
+                               "w": self.docW / 2, "h": self.docH / 2,
+                               "radius": 24]
+            }
+            var cmd: [String: Any] = ["id": "doc.addShape", "layer": id,
+                                      "fill": [0.96, 0.66, 0.24, 1],
+                                      "stroke": ["color": [0, 0, 0, 1], "width": 2]]
+            cmd.merge(params) { _, n in n }
+            self.dispatch(cmd)
+        }
+        if selLayer?.kind == "shape" {
+            run()
+        } else {
+            addLayer(kind: "shape")
+            // applyState refresh then add — schedule one hop later and
+            // force-select the fresh layer (applyState only auto-selects
+            // when nothing was selected)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                if let top = self?.layers.last?.id,
+                   self?.selLayer?.kind == "shape" {
+                    self?.selected = top
+                }
+                self?.addGenShape(gen)
+            }
+        }
+    }
+
+    // ---- printcraft: PDF → raster layers ----
+
+    /// Import every PDF page as a raster layer (PDFKit render at 2x →
+    /// embedded RGBA). Starts a fresh document sized to page 1.
+    func importPdf() {
+        let p = NSOpenPanel()
+        p.allowedContentTypes = [.pdf]
+        guard p.runModal() == .OK, let url = p.url,
+              let pdf = PDFDocument(url: url),
+              let page0 = pdf.page(at: 0) else { return }
+        let box = page0.bounds(for: .mediaBox)
+        let scale: CGFloat = 2.0
+        let W = Int(box.width * scale), H = Int(box.height * scale)
+        dispatch(["id": "doc.new", "name": url.deletingPathExtension().lastPathComponent,
+                  "w": W, "h": H], then: .none)
+        for i in 0..<pdf.pageCount {
+            guard let page = pdf.page(at: i),
+                  let rgba = Self.renderPdfPage(page, box: box, scale: scale)
+            else { continue }
+            let b64 = rgba.base64EncodedString()
+            dispatch(["id": "doc.addLayer", "kind": "raster",
+                      "name": "Page \(i + 1)", "w": W, "h": H,
+                      "rgbaB64": b64], then: .none)
+        }
+        reloadState()
+    }
+
+    /// Render one PDFPage into premultiplied RGBA bytes (white backdrop —
+    /// pages are opaque paper).
+    static func renderPdfPage(_ page: PDFPage, box: CGRect, scale: CGFloat) -> Data? {
+        let W = Int(box.width * scale), H = Int(box.height * scale)
+        guard let ctx = CGContext(
+            data: nil, width: W, height: H, bitsPerComponent: 8,
+            bytesPerRow: W * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.setFillColor(.white)
+        ctx.fill(CGRect(x: 0, y: 0, width: W, height: H))
+        ctx.translateBy(x: 0, y: CGFloat(H))
+        ctx.scaleBy(x: scale, y: -scale)
+        page.draw(with: .mediaBox, to: ctx)
+        return ctx.data.map { Data(bytes: $0, count: W * H * 4) }
+    }
 }
 
 // MARK: - Blend modes
@@ -515,6 +603,26 @@ struct DocEditorView: View {
             }
             .padding(.horizontal, 10).padding(.vertical, 7)
             .overlay(alignment: .bottom) { Kou.hairline.frame(height: 1) }
+
+            // vector shape generators — only meaningful on shape layers
+            if doc.selLayer?.kind == "shape" {
+                HStack(spacing: 5) {
+                    ForEach([("rect", "square"), ("roundRect", "squareshape"),
+                             ("ellipse", "circle"), ("star", "star"),
+                             ("line", "line.diagonal")], id: \.0) { (gen, icon) in
+                        Button { doc.addGenShape(gen) } label: {
+                            Image(systemName: icon).font(.system(size: 10))
+                                .frame(width: 22, height: 18)
+                        }
+                        .buttonStyle(.plain).foregroundStyle(Kou.accent)
+                        .background(Kou.bg3.opacity(0.5)).cornerRadius(4)
+                        .help("Add \(gen)")
+                    }
+                    Spacer()
+                }
+                .padding(.horizontal, 8).padding(.vertical, 5)
+                .overlay(alignment: .bottom) { Kou.hairline.frame(height: 1) }
+            }
 
             ScrollView {
                 VStack(spacing: 2) {

@@ -38,31 +38,44 @@ polish isn't:
   channel ops, filter gallery, liquify, text-on-path
 - ❌ Groups composite correctly but the UI can't nest/drag layers into them yet
 
-**vs the storytold craft suite** — what this beats / what it doesn't:
+**vs the storytold craft suite** — one app now spans all seven domains:
 
 - ✅ Beats on imaging: LibRaw decode breadth and camera colour where
   lightcraft falls back to embedded JPEGs and uncalibrated matrices
-- ✅ Beats on unity: Lightroom+Photoshop in one document model — the craft
-  suite splits them across apps that can't share a file format
+- ✅ Beats on unity: library + develop + layers + vector + motion + pages +
+  PDF in one session/document protocol — the craft suite splits them
+  across apps that can't share a file format or a session
+- ✅ Motion: .kmotion timeline (tracks/clips/cues/keyframes/fades) with
+  ffmpeg render, silence detection, Speech-framework transcription, and
+  minimax-h3 generative clip inserts — filmcraft+effectcraft in one
+- ✅ Pages: .kpages layout doc with frames/masters and a hand-rolled
+  PDF 1.4 writer — designcraft's core; PDF *import* (PDFKit → layers)
+  covers printcraft's read path
+- ✅ Vector: parametric shape generators + dashed strokes on shape layers
 - 🟡 Behind on plumbing maturity: they have undo stacks, menus, shortcut
   maps and a full xtask CI harness; Koubou has the command core and the
   tracker, not yet the polish
+- ❌ No transitions beyond fades, no audio ducking UI, no path boolean
+  ops, no PDF annotation/preflight — the deep ends of each domain
 
 ## Where we're going (ordered)
 
 1. **Undo/redo for documents** — command-level snapshot history in the
    session (bounded by memory), exposed as `doc.undo`/`doc.redo`
-2. **Doc inspector parity** — curves, wheels, qualifier and power windows
+2. **Timeline depth** — transitions (wipe/dip), audio ducking/EQ UI,
+   ripple editing, speed ramps
+3. **Canvas manipulation** — drag-move layers/clips, marquee select,
+   on-canvas text edit, transform handles
+4. **Doc inspector parity** — curves, wheels, qualifier and power windows
    in the layer inspector (the recipe engine already does all of it)
-3. **Canvas manipulation** — drag-move layers, marquee select, on-canvas
-   text edit, transform handles
-4. **Mask UX** — mask thumbnail, gradient/brush tools, mask-from-qualifier
-5. **Export breadth** — JPEG/TIFF/WebP export with size/quality options;
+5. **Mask UX** — mask thumbnail, gradient/brush tools, mask-from-qualifier
+6. **Pages depth** — text flow between frames, facing pages, styles
+7. **Export breadth** — JPEG/TIFF/WebP export with size/quality options;
    PSD export if a sane writer exists
-6. **Groups in UI** — nesting, expand/collapse, drag between levels
-7. **xtask CI** — fmt/clippy/layers/parity in one command (today:
+8. **Groups in UI** — nesting, expand/collapse, drag between levels
+9. **xtask CI** — fmt/clippy/layers/parity in one command (today:
    `scripts/parity_check.sh` + `cargo test --workspace`)
-8. **Batch ops** — scan folder → apply recipe → export, via the CLI/MCP
+10. **Batch ops** — scan folder → apply recipe → export, via the CLI/MCP
 
 ## Engineering notes
 

@@ -82,9 +82,16 @@ consistent with this.
   → `araware_*` C FFI. Sidecars are `<stem>.araware.json` (shared with
   araware); env: `ARA_DISABLE_GPU`, `ARAWARE_HOME`.
 - `composer/`: `doc` (model+serde), `composite` (layer stack renderer),
-  `blend` (27 modes), `shape` (SVG path → tiny-skia), `text` (fontdue +
-  fontdb), `psd` (import), `commands` (dispatch), `capi` (`kou_*` FFI)
+  `blend` (27 modes), `shape` (SVG path → tiny-skia + generators + dash),
+  `text` (fontdue + fontdb), `psd` (import), `commands` (dispatch — routes
+  `tl.*`→motion, `pg.*`→pages), `capi` (`kou_*` FFI)
+- `motion/`: `.kmotion` timeline (tracks/clips/keyframes/cues) + ffmpeg
+  render + silencedetect + minimax-h3 `tl.generateClip`
+- `pages/`: `.kpages` multi-page layout + hand-rolled PDF 1.4 writer
 - `cli/`: `main.rs` — file verbs, `control` (TCP/stdio), `mcp`
-- `mac/`: `KoubouApp` (store+menus), `LibraryView` (grid), `EditorView`
-  (single-photo develop), `DocEditorView` (layers workspace), `Engine.swift`
+- `mac/`: `KoubouApp`+`StudioView` (mode switch: Library|Layers|Motion|
+  Pages), `LibraryView` (grid), `EditorView` (single-photo develop),
+  `DocEditorView` (layers workspace + vector generators + PDF import via
+  PDFKit), `MotionView` (timeline + Speech transcription + h3ui generate),
+  `PagesView` (page thumbnails + frame inspector), `Engine.swift`
   (`EngineSession`, `DocSession` FFI wrappers)

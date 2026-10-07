@@ -100,3 +100,37 @@ Note the layer-id param name is **`layer`** — `"id"` is the command name.
 All failures are `{"ok":false,"error":"…"}` with a human-readable chain
 (`context` messages from the engine: missing file, bad recipe, unknown
 layer, unsupported kind). Unknown `id` → `unknown command id: …`.
+
+## Motion domain (`tl.*`) — .kmotion timelines
+
+The same dispatch, routed to the timeline session. Envelope identical.
+
+| id | params |
+|---|---|
+| `tl.new` | `w`, `h`, `fps`, `name`? |
+| `tl.open` / `tl.save` | `path` |
+| `tl.json` | — |
+| `tl.addTrack` | `kind` video\|audio\|subtitle |
+| `tl.addClip` | `track`, `src`, `in`?, `out`?, `offset`? |
+| `tl.setClip` | `clip` + `in`/`out`/`offset`/`opacity`/`scale`/`fadeIn`/`fadeOut` |
+| `tl.removeClip` | `clip` |
+| `tl.addCue` | `t`, `dur`, `text` |
+| `tl.probe` | `path` — ffprobe JSON |
+| `tl.renderFrame` | `t` → `{"pngB64":…}` or `out` |
+| `tl.render` | `out` — mp4 via ffmpeg |
+| `tl.detectSilence` | `path` → `{"ranges":[{start,end}]}` |
+| `tl.generateClip` | `endpoint`, `prompt` — minimax-h3/h3ui |
+
+## Pages domain (`pg.*`) — .kpages layouts
+
+| id | params |
+|---|---|
+| `pg.new` | `name`, `pageW`, `pageH`, `margins`? |
+| `pg.open` / `pg.save` | `path` |
+| `pg.json` | — |
+| `pg.addPage` / `pg.removePage` | `page`? |
+| `pg.setMaster` | `page`, master name |
+| `pg.addFrame` | `page`, `kind` text\|image\|rect\|line + `x,y,w,h` (pt) |
+| `pg.setFrame` / `pg.removeFrame` | `page`, `frame` |
+| `pg.render` | `out` — PDF 1.4 |
+| `pg.renderPng` | `page`, `out`/`pngB64`, `maxPx`? |

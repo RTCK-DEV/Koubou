@@ -27,11 +27,7 @@ fn db() -> std::sync::MutexGuard<'static, Option<fontdb::Database>> {
 /// pick a font: explicit path > family name (+bold/italic) > platform default
 fn load_font(spec: &str, bold: bool, italic: bool) -> Result<fontdue::Font> {
     let key = format!("{spec}|{bold}|{italic}");
-    if let Some(f) = FONTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-    {
+    if let Some(f) = FONTS.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return Ok(f.clone());
     }
 
@@ -170,7 +166,11 @@ pub fn rasterize(tc: &TextContent) -> Result<(Vec<u8>, u32, u32)> {
             if !cur.is_empty() && cur_w + w > tc.wrap_width {
                 lines.push(cur.trim_end().to_string());
                 cur = word.trim_start().to_string();
-                cur_w = word.trim_start().chars().map(|c| font.metrics(c, px).advance_width + tc.tracking).sum();
+                cur_w = word
+                    .trim_start()
+                    .chars()
+                    .map(|c| font.metrics(c, px).advance_width + tc.tracking)
+                    .sum();
             } else {
                 cur.push_str(word);
                 cur_w += w;

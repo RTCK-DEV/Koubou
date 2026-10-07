@@ -1065,6 +1065,8 @@ dependencies = [
  "fontdb",
  "fontdue",
  "image",
+ "koubou-motion",
+ "koubou-pages",
  "log",
  "psd",
  "rayon",
@@ -1072,6 +1074,35 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tiny-skia",
+]
+
+[[package]]
+name = "koubou-motion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fontdb",
+ "fontdue",
+ "image",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "koubou-pages"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "fontdb",
+ "fontdue",
+ "image",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
