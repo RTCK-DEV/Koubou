@@ -20,6 +20,13 @@ import UniformTypeIdentifiers
 final class CanvasOverlayNSView: NSView {
     private var bandWin: NSWindow?
     private var outlineWin: NSWindow?
+    private var monitors: [Any] = []
+    /// scroll-wheel on the canvas: (view-space point, delta, modifiers,
+    /// view size) — two-finger scroll pans, cmd-scroll zooms. Called
+    /// from an NSEvent local monitor so no hit-testing is disturbed.
+    var onScroll: ((CGPoint, CGSize, NSEvent.ModifierFlags, CGSize) -> Void)?
+    /// spacebar held state for pan mode (keyCode 49)
+    var onSpace: ((Bool) -> Void)?
     private static let accent =
         NSColor(srgbRed: 1.0, green: 0.62, blue: 0.13, alpha: 1)
 
@@ -27,6 +34,34 @@ final class CanvasOverlayNSView: NSView {
     override var isFlipped: Bool { true }
 
     override func hitTest(_ p: NSPoint) -> NSView? { nil }
+
+    private func installMonitors() {
+        for m in monitors { NSEvent.removeMonitor(m) }
+        monitors.removeAll()
+        if let m = NSEvent.addLocalMonitorForEvents(
+            matching: .scrollWheel,
+            handler: { [weak self] ev in
+                guard let self = self, let w = self.window,
+                      ev.window === w else { return ev }
+                let p = self.convert(ev.locationInWindow, to: nil)
+                if self.bounds.contains(p) {
+                    self.onScroll?(p, CGSize(width: ev.deltaX, height: ev.deltaY),
+                                   ev.modifierFlags, self.bounds.size)
+                }
+                return ev
+            }) { monitors.append(m) }
+        for mask: NSEvent.EventTypeMask in [.keyDown, .keyUp] {
+            if let m = NSEvent.addLocalMonitorForEvents(
+                matching: mask,
+                handler: { [weak self] ev in
+                    if ev.keyCode == 49, !ev.isARepeat,
+                       let self = self, ev.window === self.window {
+                        self.onSpace?(mask == .keyDown)
+                    }
+                    return ev
+                }) { monitors.append(m) }
+        }
+    }
 
     private func makeWindow(fill: NSColor?, border: NSColor?) -> NSWindow {
         let ow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 4, height: 4),
@@ -75,6 +110,11 @@ final class CanvasOverlayNSView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         NotificationCenter.default.removeObserver(self)
+        if window != nil { installMonitors() }
+        else {
+            for m in monitors { NSEvent.removeMonitor(m) }
+            monitors.removeAll()
+        }
         guard let w = window else { return }
         let hide: (Notification) -> Void = { [weak self] _ in
             self?.setDraw(band: nil, outline: nil)
@@ -91,6 +131,7 @@ final class CanvasOverlayNSView: NSView {
     }
 
     deinit {
+        for m in monitors { NSEvent.removeMonitor(m) }
         bandWin?.orderOut(nil); outlineWin?.orderOut(nil)
         NotificationCenter.default.removeObserver(self)
     }
@@ -103,6 +144,10 @@ private struct CanvasOverlay: NSViewRepresentable {
     func makeNSView(context: Context) -> CanvasOverlayNSView {
         let v = CanvasOverlayNSView()
         doc.overlay = v
+        v.onScroll = { [weak doc] p, d, mods, size in
+            doc?.canvasScroll(at: p, delta: d, mods: mods, viewSize: size)
+        }
+        v.onSpace = { [weak doc] held in doc?.spaceHeld = held }
         return v
     }
     func updateNSView(_ v: CanvasOverlayNSView, context: Context) {}
@@ -175,6 +220,14 @@ final class DocStore: ObservableObject {
     @Published var maskArmed = false
     @Published var brushRadius: Double = 48
     @Published var brushErase = true   // true = hide, false = reveal
+    @Published var brushSoftness: Double = 0.6
+    // canvas view transform: zoom (1 = fit) + pan in view points
+    @Published var zoom: CGFloat = 1
+    @Published var pan: CGSize = .zero
+    /// spacebar held → drag pans instead of moving layers
+    @Published var spaceHeld = false
+    /// node-edit mode for the selected shape layer
+    @Published var nodeEdit = false
     let previewMaxPx: UInt32 = 1600
 
     private var pendingImageReload = false
@@ -450,6 +503,8 @@ final class DocStore: ObservableObject {
             selected = layers.last?.id
         }
         selectedSet = selectedSet.filter { Self.find($0, in: layers) != nil }
+        if nodeEdit && selLayer?.kind != "shape" { nodeEdit = false }
+        if nodeEdit { refreshNodes() }
     }
 
     static func decodePNG(_ r: [String: Any]) -> CGImage? {
@@ -575,13 +630,66 @@ final class DocStore: ObservableObject {
         dispatch(["id": "doc.setLayer", "layer": id, "recipe": obj])
     }
 
+    // ---- canvas view transform (zoom/pan) ----
+
+    /// zoom in/out by a factor about the view center (pan preserved)
+    func zoomBy(_ f: CGFloat) {
+        zoom = min(max(zoom * f, 0.05), 64)
+    }
+    /// ⌘0: fit the document (reset zoom + pan); ⌘1: 100% pixels
+    func zoomFit() { zoom = 1; pan = .zero }
+    func zoom100() { zoom = 1 }   // same as fit here — fit *is* 100% of canvas
+
+    /// scroll-wheel on the canvas: cmd-scroll zooms about the cursor,
+    /// plain scroll pans (natural scrolling: content follows fingers)
+    func canvasScroll(at p: CGPoint, delta d: CGSize,
+                      mods: NSEvent.ModifierFlags, viewSize size: CGSize) {
+        if mods.contains(.command) {
+            let z0 = zoom
+            let z1 = min(max(z0 * exp(d.height * 0.004), 0.05), 64)
+            guard z1 != z0 else { return }
+            // keep the doc point under the cursor fixed
+            let f = z1 / z0
+            pan = CGSize(
+                width: p.x - size.width / 2 - (p.x - size.width / 2 - pan.width) * f,
+                height: p.y - size.height / 2 - (p.y - size.height / 2 - pan.height) * f)
+            zoom = z1
+        } else {
+            pan = CGSize(width: pan.width + d.width,
+                         height: pan.height + d.height)
+        }
+    }
+
+    // ---- node editing (shape layers) ----
+
+    /// cached node list for the node-edited layer: [(x, y, kind)]
+    @Published var nodes: [[String: Any]] = []
+    func refreshNodes() {
+        guard nodeEdit, let id = selected,
+              DocStore.find(id, in: layers)?.kind == "shape" else {
+            nodes = []; return
+        }
+        guard let s = ensure() else { return }
+        let r = s.workSync { sess in
+            sess.dispatch(["id": "doc.shapeNodes", "layer": id])
+        }
+        nodes = (r["result"] as? [String: Any])?["nodes"] as? [[String: Any]] ?? []
+    }
+    /// move node `index` of the node-edited layer to doc coords (x,y)
+    func moveNode(_ index: Int, x: Double, y: Double) {
+        guard let id = selected else { return }
+        dispatch(["id": "doc.moveNode", "layer": id, "index": index,
+                  "x": x, "y": y])
+    }
+
     /// Continuous mask stroke: dispatch the dab immediately (cheap buffer
     /// edit) and coalesce the composite repaint.
     func paintMask(cx: Double, cy: Double) {
         guard let id = selected else { return }
         dispatch(["id": "doc.maskPaint", "layer": id,
                   "cx": cx, "cy": cy, "r": brushRadius,
-                  "value": brushErase ? 0.0 : 1.0, "softness": 0.6],
+                  "value": brushErase ? 0.0 : 1.0,
+                  "softness": brushSoftness],
                  then: .none)
         reloadImageSoon()
     }
@@ -744,6 +852,28 @@ struct DocEditorView: View {
                 .font(.system(size: 10).monospacedDigit())
                 .foregroundStyle(Kou.text3)
             Spacer()
+            // zoom controls: ⌘-/⌘+ step, ⌘0 fits (resets pan too)
+            HStack(spacing: 2) {
+                Button("−") { doc.zoomBy(1 / 1.25) }
+                    .buttonStyle(KouSecondaryButton())
+                Menu {
+                    Button("Fit (⌘0)") { doc.zoomFit() }
+                    Button("50%") { doc.zoom = 0.5; doc.pan = .zero }
+                    Button("100%") { doc.zoom = 1; doc.pan = .zero }
+                    Button("200%") { doc.zoom = 2; doc.pan = .zero }
+                    Button("400%") { doc.zoom = 4; doc.pan = .zero }
+                } label: {
+                    Text("\(Int((doc.zoom * 100).rounded()))%")
+                        .font(.system(size: 10, weight: .medium).monospacedDigit())
+                        .frame(minWidth: 34)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                Button("+") { doc.zoomBy(1.25) }
+                    .buttonStyle(KouSecondaryButton())
+            }
+            .help("Zoom — scroll to pan, ⌘-scroll or pinch to zoom, space-drag to pan")
+            Spacer()
             if doc.busy { ProgressView().controlSize(.small).tint(Kou.accent) }
             if let e = doc.error {
                 Text(e).font(.system(size: 10)).foregroundStyle(.red.opacity(0.9)).lineLimit(1)
@@ -770,10 +900,18 @@ struct DocEditorView: View {
         .background(Kou.bg1)
         .overlay(alignment: .bottom) { Kou.hairline.frame(height: 1) }
         .background(
-            // cmd+S shortcut
-            Button("") { doc.save() }
-                .keyboardShortcut("s", modifiers: .command)
-                .opacity(0).frame(width: 0, height: 0)
+            // cmd+S + zoom shortcuts
+            VStack {
+                Button("") { doc.save() }
+                    .keyboardShortcut("s", modifiers: .command)
+                Button("") { doc.zoomFit() }
+                    .keyboardShortcut("0", modifiers: .command)
+                Button("") { doc.zoomBy(1.25) }
+                    .keyboardShortcut("=", modifiers: .command)
+                Button("") { doc.zoomBy(1 / 1.25) }
+                    .keyboardShortcut("-", modifiers: .command)
+            }
+            .opacity(0).frame(width: 0, height: 0)
         )
     }
 
@@ -786,9 +924,19 @@ struct DocEditorView: View {
         case moving(UInt64, CGPoint, CGPoint)   // layer, doc-space start, orig x/y
         case marquee(CGPoint, CGPoint)          // start, current (view space)
         case scaling(UInt64, CGPoint, Double, Double) // layer, bbox center, start dist, orig scale
+        case panning                            // space held: pan the canvas
+        case node(Int, CGPoint)                 // node index, doc-space start
     }
     @State private var dragMode: DragMode = .none
     @State private var pickStarted = false
+    /// live pinch/pan deltas — @GestureState updates mid-gesture
+    /// (@Published/@State writes inside a gesture defer to release)
+    @GestureState private var pinchBy: CGFloat = 1
+    @GestureState private var pinchPan: CGSize = .zero
+    @GestureState private var dragPan: CGSize = .zero
+    /// live node drag position (doc coords) — handle only; the shape
+    /// pixels commit on release
+    @State private var nodeLive: (index: Int, pt: CGPoint)? = nil
     /// last tap on a text layer — a second tap within 0.45s opens the
     /// on-canvas editor (drag-based: a zero-distance DragGesture always
     /// wins over TapGesture(count:2), so clicks are detected here)
@@ -800,13 +948,14 @@ struct DocEditorView: View {
 
     private var canvas: some View {
         GeometryReader { geo in
-            let rect = imageRect(in: geo.size)
+            let rect = canvasRect(in: geo.size)
             ZStack {
                 Checkerboard()
                     .clipShape(RoundedRectangle(cornerRadius: 4))
                 if let img = doc.composite {
                     Image(decorative: img, scale: 1)
                         .resizable()
+                        .interpolation(.high)
                         .frame(width: rect.width, height: rect.height)
                         .position(x: rect.midX, y: rect.midY)
                 } else {
@@ -815,6 +964,8 @@ struct DocEditorView: View {
                 }
 
                 selectionOverlay(in: geo.size)
+                    .allowsHitTesting(false)
+                nodeOverlay(in: geo.size)
                     .allowsHitTesting(false)
 
                 // in-flight drag visuals (marquee band / moving outline)
@@ -850,7 +1001,33 @@ struct DocEditorView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Kou.bg0)
             .contentShape(Rectangle())
+            .onExitCommand {
+                if doc.nodeEdit { doc.nodeEdit = false; doc.refreshNodes() }
+            }
             .gesture(canvasDrag(in: geo.size))
+            .simultaneousGesture(
+                MagnifyGesture()
+                    .updating($pinchBy) { g, st, _ in
+                        st = g.magnification
+                    }
+                    .updating($pinchPan) { g, st, _ in
+                        // keep the pinch anchor's doc point fixed
+                        let a = g.startLocation
+                        let c = CGPoint(x: geo.size.width / 2 + doc.pan.width,
+                                        y: geo.size.height / 2 + doc.pan.height)
+                        st = CGSize(
+                            width: (a.x - c.x) * (1 - g.magnification),
+                            height: (a.y - c.y) * (1 - g.magnification))
+                    }
+                    .onEnded { g in
+                        let a = g.startLocation
+                        let c = CGPoint(x: geo.size.width / 2 + doc.pan.width,
+                                        y: geo.size.height / 2 + doc.pan.height)
+                        doc.pan = CGSize(
+                            width: doc.pan.width + (a.x - c.x) * (1 - g.magnification),
+                            height: doc.pan.height + (a.y - c.y) * (1 - g.magnification))
+                        doc.zoom = min(max(doc.zoom * g.magnification, 0.05), 64)
+                    })
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let p): doc.hoverPt = p
@@ -897,6 +1074,40 @@ struct DocEditorView: View {
         }
     }
 
+    /// node handles over a node-edited shape layer
+    @ViewBuilder
+    private func nodeOverlay(in size: CGSize) -> some View {
+        if doc.nodeEdit, let sel = doc.selected,
+           DocStore.find(sel, in: doc.layers)?.kind == "shape" {
+            ForEach(Array(doc.nodes.enumerated()), id: \.offset) { i, n in
+                let nx = (n["x"] as? NSNumber)?.doubleValue ?? 0
+                let ny = (n["y"] as? NSNumber)?.doubleValue ?? 0
+                let pt = (nodeLive?.index == i ? nodeLive!.pt
+                          : CGPoint(x: nx, y: ny))
+                let v = viewRect(CGRect(x: pt.x, y: pt.y,
+                                        width: 0, height: 0), in: size).origin
+                let curved = ["c", "q"].contains((n["kind"] as? String) ?? "")
+                ZStack {
+                    if curved {
+                        RoundedRectangle(cornerRadius: 1.5)
+                            .fill(Color.white)
+                            .frame(width: 8, height: 8)
+                            .overlay(RoundedRectangle(cornerRadius: 1.5)
+                                .stroke(Kou.accent, lineWidth: 1))
+                    } else {
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: 7, height: 7)
+                            .overlay(Circle()
+                                .stroke(Kou.accent, lineWidth: 1))
+                    }
+                }
+                .shadow(color: .black.opacity(0.4), radius: 1)
+                .position(v)
+            }
+        }
+    }
+
     /// corner 0..3 → view-space position of a rect's corner
     private func handlePoint(_ c: Int, of r: CGRect) -> CGPoint {
         switch c {
@@ -909,7 +1120,7 @@ struct DocEditorView: View {
 
     /// doc-space rect → view-space rect
     private func viewRect(_ docRect: CGRect, in size: CGSize) -> CGRect {
-        let rect = imageRect(in: size)
+        let rect = canvasRect(in: size)
         guard doc.docW > 0 else { return docRect }
         let k = rect.width / CGFloat(doc.docW)
         return CGRect(x: rect.minX + docRect.minX * k,
@@ -917,17 +1128,39 @@ struct DocEditorView: View {
                       width: docRect.width * k, height: docRect.height * k)
     }
 
-    /// main canvas gesture: mask paint > handle scale > move > marquee
+    /// main canvas gesture: pan > node > mask paint > handle > move > marquee
     private func canvasDrag(in size: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 0)
+            .updating($dragPan) { g, st, _ in
+                if case .panning = dragMode { st = g.translation }
+            }
             .onChanged { g in
                 let dpt = docPoint(g.location, in: size)
                 let startDpt = docPoint(g.startLocation, in: size)
                 switch dragMode {
                 case .none:
+                    if doc.spaceHeld, doc.textEdit == nil {
+                        dragMode = .panning
+                        return
+                    }
                     if doc.maskArmed {
                         doc.paintMask(cx: Double(dpt.x), cy: Double(dpt.y))
                         return
+                    }
+                    // node-edit mode: grab a node of the selected shape
+                    if doc.nodeEdit, let sel = doc.selected,
+                       DocStore.find(sel, in: doc.layers)?.kind == "shape" {
+                        for (i, n) in doc.nodes.enumerated() {
+                            let nx = (n["x"] as? NSNumber)?.doubleValue ?? 0
+                            let ny = (n["y"] as? NSNumber)?.doubleValue ?? 0
+                            let vp = viewRect(CGRect(x: nx, y: ny,
+                                                     width: 0, height: 0),
+                                              in: size).origin
+                            if vp.distance(to: g.startLocation) <= 10 {
+                                dragMode = .node(i, startDpt)
+                                return
+                            }
+                        }
                     }
                     // corner handle grab? (view space, 9pt targets)
                     if let sel = doc.selected, let b = doc.layerBounds[sel] {
@@ -965,7 +1198,7 @@ struct DocEditorView: View {
                     if let b = doc.layerBounds[id] {
                         var vr = viewRect(b, in: size)
                         let k = doc.docW > 0
-                            ? imageRect(in: size).width / CGFloat(doc.docW) : 1
+                            ? canvasRect(in: size).width / CGFloat(doc.docW) : 1
                         vr.origin.x += dx * k
                         vr.origin.y += dy * k
                         doc.overlay?.setDraw(band: nil, outline: vr)
@@ -992,6 +1225,10 @@ struct DocEditorView: View {
                                                  outline: viewRect(ob, in: size))
                         }
                     }
+                case .panning:
+                    break   // dragPan @GestureState drives the offset
+                case .node(let i, _):
+                    nodeLive = (i, dpt)
                 }
             }
             .onEnded { g in
@@ -1007,13 +1244,19 @@ struct DocEditorView: View {
                     + g.translation.height * g.translation.height < 16
                 var opened: UInt64? = nil
                 if tapLike, case .moving(let id, _, _) = dragMode,
-                   let l = DocStore.find(id, in: doc.layers), l.kind == "text" {
+                   let l = DocStore.find(id, in: doc.layers),
+                   l.kind == "text" || l.kind == "shape" {
                     let now = Date()
                     if let last = lastTap, last.id == id,
                        now.timeIntervalSince(last.time)
                         < NSEvent.doubleClickInterval {
-                        doc.textEdit = (id, (l.text?["text"] as? String) ?? "")
-                        opened = id
+                        if l.kind == "text" {
+                            doc.textEdit = (id, (l.text?["text"] as? String) ?? "")
+                            opened = id
+                        } else {
+                            doc.nodeEdit.toggle()
+                            doc.refreshNodes()
+                        }
                         lastTap = nil
                     } else {
                         lastTap = (now, id)
@@ -1038,6 +1281,19 @@ struct DocEditorView: View {
                        l.scale != s0 {
                         doc.commitTransform(id)
                     }
+                case .panning:
+                    doc.pan = CGSize(
+                        width: doc.pan.width + g.translation.width,
+                        height: doc.pan.height + g.translation.height)
+                case .node(let i, let start):
+                    if let live = nodeLive, live.index == i,
+                       doc.nodes.indices.contains(i),
+                       let nx = (doc.nodes[i]["x"] as? NSNumber)?.doubleValue,
+                       let ny = (doc.nodes[i]["y"] as? NSNumber)?.doubleValue {
+                        doc.moveNode(i, x: nx + Double(live.pt.x - start.x),
+                                     y: ny + Double(live.pt.y - start.y))
+                    }
+                    nodeLive = nil
                 default:
                     break
                 }
@@ -1085,9 +1341,20 @@ struct DocEditorView: View {
                       width: w, height: h)
     }
 
+    /// the fit rect transformed by the live view state (zoom × pan):
+    /// everything that maps view↔doc space goes through this
+    private func canvasRect(in size: CGSize) -> CGRect {
+        let base = imageRect(in: size)
+        let s = doc.zoom * pinchBy
+        let w = base.width * s, h = base.height * s
+        let cx = base.midX + doc.pan.width + pinchPan.width + dragPan.width
+        let cy = base.midY + doc.pan.height + pinchPan.height + dragPan.height
+        return CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h)
+    }
+
     /// view point → document pixel coords
     private func docPoint(_ p: CGPoint, in size: CGSize) -> CGPoint {
-        let rect = imageRect(in: size)
+        let rect = canvasRect(in: size)
         guard doc.composite != nil, rect.width > 0, doc.docW > 0 else { return .zero }
         let sx = Double(doc.docW) / Double(rect.width)
         return CGPoint(x: Double(p.x - rect.minX) * sx,
@@ -1095,7 +1362,7 @@ struct DocEditorView: View {
     }
 
     private func brushViewSize(in size: CGSize) -> CGFloat {
-        let rect = imageRect(in: size)
+        let rect = canvasRect(in: size)
         guard doc.docW > 0 else { return 20 }
         return max(6, CGFloat(doc.brushRadius * 2) * rect.width / CGFloat(doc.docW))
     }
@@ -1586,6 +1853,9 @@ struct LayerInspector: View {
                     doc.maskArmed.toggle()
                 }
                 if layer.hasMask {
+                    ToolChip(label: "Invert", icon: "arrow.left.arrow.right") {
+                        doc.dispatch(["id": "doc.maskInvert", "layer": layer.id])
+                    }
                     ToolChip(label: "Clear", icon: "xmark") {
                         doc.setLayer(layer.id, ["mask": NSNull()])
                     }
@@ -1594,6 +1864,7 @@ struct LayerInspector: View {
             }
             if doc.maskArmed {
                 SliderRow("Radius", $doc.brushRadius, 4...400, reset: 48)
+                SliderRow("Softness", $doc.brushSoftness, 0...1, reset: 0.6)
                 SegPicker([(true, "Hide"), (false, "Reveal")], selection: $doc.brushErase)
                 Text("Drag on the canvas to paint the mask.")
                     .font(.system(size: 9)).foregroundStyle(Kou.text3)
@@ -2210,10 +2481,22 @@ struct ShapeInspector: View {
                         dText = layer.shapes?.first?["d"] as? String ?? ""
                     }
                 }
-            Button("Apply path") {
-                setShapes([["d": dText, "fill": [0.96, 0.66, 0.24, 1]]])
+            HStack(spacing: 6) {
+                Button("Apply path") {
+                    setShapes([["d": dText, "fill": [0.96, 0.66, 0.24, 1]]])
+                }
+                .buttonStyle(KouSecondaryButton())
+                ToolChip(label: doc.nodeEdit ? "Editing nodes" : "Edit nodes",
+                         icon: "point.topleft.down.curvedto.point.bottomright.up",
+                         active: doc.nodeEdit) {
+                    doc.nodeEdit.toggle()
+                    doc.refreshNodes()
+                }
             }
-            .buttonStyle(KouSecondaryButton())
+            if doc.nodeEdit {
+                Text("Drag the handles on the canvas — Esc exits node mode.")
+                    .font(.system(size: 9)).foregroundStyle(Kou.text3)
+            }
         }
     }
 

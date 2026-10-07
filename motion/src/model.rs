@@ -258,6 +258,78 @@ impl Timeline {
         Ok(new_id)
     }
 
+    /// ripple-delete a clip: remove it and shift every later clip on the
+    /// same track left by its duration (closing the gap). Other tracks
+    /// are untouched. Returns true when the clip existed.
+    pub fn ripple_delete(&mut self, id: u64) -> bool {
+        let Some((ti, ci)) = self.find_clip(id) else {
+            return false;
+        };
+        let clip = self.tracks[ti].clips.remove(ci);
+        let gap = clip.duration();
+        let from = clip.offset;
+        if gap <= 0.0 {
+            return true;
+        }
+        for c in &mut self.tracks[ti].clips {
+            if c.offset >= from {
+                c.offset = (c.offset - gap).max(0.0);
+            }
+        }
+        true
+    }
+
+    /// ripple-insert `clip` at its `offset` on `track`: every clip on
+    /// that track starting at or after the offset shifts right by the
+    /// inserted clip's duration, then the clip is added. Returns its id.
+    pub fn ripple_insert(&mut self, track: usize, mut clip: Clip) -> Result<u64> {
+        let t = self
+            .tracks
+            .get_mut(track)
+            .with_context(|| format!("track index {track} out of range"))?;
+        clip.sanitize();
+        let gap = clip.duration();
+        let at = clip.offset;
+        if gap > 0.0 {
+            for c in &mut t.clips {
+                if c.offset >= at {
+                    c.offset += gap;
+                }
+            }
+        }
+        clip.id = self.next_id;
+        self.next_id += 1;
+        let new_id = clip.id;
+        t.clips.push(clip);
+        t.clips.sort_by(|a, b| {
+            a.offset
+                .partial_cmp(&b.offset)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(new_id)
+    }
+
+    /// trim a clip edge by `delta` seconds (positive extends): `edge` is
+    /// "in" (source start moves right, clip keeps its offset and gets
+    /// shorter from the left — delta > 0 shortens) or "out" (end extends
+    /// right). Values are clamped so in_point stays ≥ 0 and ≤ out_point.
+    pub fn trim_clip(&mut self, id: u64, edge_in: bool, delta: f64) -> bool {
+        if !delta.is_finite() {
+            return false;
+        }
+        let Some((ti, ci)) = self.find_clip(id) else {
+            return false;
+        };
+        let c = &mut self.tracks[ti].clips[ci];
+        if edge_in {
+            c.in_point = (c.in_point + delta).clamp(0.0, c.out_point);
+        } else {
+            c.out_point = (c.out_point + delta).max(c.in_point);
+        }
+        c.sanitize();
+        true
+    }
+
     /// clone a clip onto the same track, parked right after the original
     pub fn duplicate_clip(&mut self, id: u64) -> Result<u64> {
         let (ti, ci) = self
@@ -565,6 +637,56 @@ pub struct Clip {
     /// out-transition; replaces the plain fade-out when set
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trans_out: Option<Transition>,
+    /// playback rate: 1 = realtime, 2 = 2× (consumes source twice as fast),
+    /// 0.5 = slow-mo (stretches source over the clip span). The clip keeps
+    /// its timeline duration; rate changes which source frames show.
+    #[serde(default = "one_rate", skip_serializing_if = "is_one")]
+    pub rate: f64,
+    /// 3-band EQ (dB) applied to this clip's audio
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eq: Option<Eq>,
+    /// compressor applied to this clip's audio
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comp: Option<Comp>,
+}
+
+fn one_rate() -> f64 {
+    1.0
+}
+fn is_one(v: &f64) -> bool {
+    *v == 1.0
+}
+
+/// 3-band equaliser: low/mid/high shelf-peaking gains in dB
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Eq {
+    #[serde(default)]
+    pub low: f64,
+    #[serde(default)]
+    pub mid: f64,
+    #[serde(default)]
+    pub high: f64,
+}
+
+/// compressor settings (ffmpeg acompressor semantics)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Comp {
+    /// threshold in dB (≤ 0)
+    #[serde(default)]
+    pub threshold: f64,
+    #[serde(default = "one_rate")]
+    pub ratio: f64,
+    /// attack ms
+    #[serde(default)]
+    pub attack: f64,
+    /// release ms
+    #[serde(default)]
+    pub release: f64,
+    /// makeup gain dB
+    #[serde(default)]
+    pub makeup: f64,
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -590,6 +712,9 @@ impl Clip {
             volume: Vec::new(),
             trans_in: None,
             trans_out: None,
+            rate: 1.0,
+            eq: None,
+            comp: None,
         }
     }
 
@@ -679,6 +804,11 @@ impl Clip {
         eval_kf(&self.volume, local, 1.0).clamp(0.0, 2.0)
     }
 
+    /// source-media time at clip-local time (rate applied)
+    pub fn media_at(&self, local: f64) -> f64 {
+        self.in_point + local.max(0.0) * self.rate
+    }
+
     /// horizontal transition offset at clip-local time, in pixels of the
     /// clip's own width `w`: slide/wipe-in animates -w -> 0, slide/wipe-out
     /// 0 -> +w. Dip has no positional component.
@@ -744,6 +874,34 @@ impl Clip {
         self.out_point = self.out_point.max(self.in_point);
         self.fade_in = self.fade_in.clamp(0.0, self.duration());
         self.fade_out = self.fade_out.clamp(0.0, self.duration());
+        if !self.rate.is_finite() {
+            self.rate = 1.0;
+        }
+        self.rate = self.rate.clamp(0.05, 20.0);
+        if let Some(e) = &mut self.eq {
+            for v in [&mut e.low, &mut e.mid, &mut e.high] {
+                if !v.is_finite() {
+                    *v = 0.0;
+                }
+                *v = v.clamp(-24.0, 24.0);
+            }
+        }
+        if let Some(cp) = &mut self.comp {
+            if !cp.threshold.is_finite() {
+                cp.threshold = -20.0;
+            }
+            cp.threshold = cp.threshold.clamp(-80.0, 0.0);
+            if !cp.ratio.is_finite() {
+                cp.ratio = 1.0;
+            }
+            cp.ratio = cp.ratio.clamp(1.0, 50.0);
+            for v in [&mut cp.attack, &mut cp.release, &mut cp.makeup] {
+                if !v.is_finite() {
+                    *v = 0.0;
+                }
+                *v = v.max(0.0);
+            }
+        }
         let cd = self.duration();
         if let Some(t) = &mut self.trans_in {
             t.sanitize(cd);
@@ -1194,5 +1352,64 @@ mod tests {
         assert_eq!(c.volume_at(9.5), 1.0);
         // ducking the subtitle track itself errors
         assert!(tl.duck(st, None, 0.25, 0.5, 0.5).is_err());
+    }
+
+    #[test]
+    fn ripple_insert_delete_and_trim() {
+        let mut tl = Timeline::new("t", 640, 480, 30.0);
+        let v = tl.add_track(TrackKind::Video);
+        let a = tl.add_clip(v, Clip::media("a.mp4", 0.0, 2.0, 0.0)).unwrap();
+        let b = tl.add_clip(v, Clip::media("b.mp4", 0.0, 3.0, 2.0)).unwrap();
+
+        // ripple-insert a 1s clip at 1.0: 'b' shifts right by 1
+        let c = tl
+            .ripple_insert(v, Clip::media("c.mp4", 0.0, 1.0, 1.0))
+            .unwrap();
+        let cb = tl.clip(b).unwrap();
+        assert_eq!(cb.offset, 3.0);
+
+        // ripple-delete the inserted clip: 'b' slides back left by 1
+        assert!(tl.ripple_delete(c));
+        let cb = tl.clip(b).unwrap();
+        assert_eq!(cb.offset, 2.0);
+
+        // trim: extend 'b' out edge +1, pull 'a' in edge +0.5 (shortens)
+        assert!(tl.trim_clip(b, false, 1.0));
+        let cb = tl.clip(b).unwrap();
+        assert_eq!(cb.out_point, 4.0);
+        assert!(tl.trim_clip(a, true, 0.5));
+        let ca = tl.clip(a).unwrap();
+        assert_eq!(ca.in_point, 0.5);
+        assert_eq!(ca.duration(), 1.5);
+        // in-point clamped to out-point, never crosses
+        assert!(tl.trim_clip(a, true, 99.0));
+        let ca = tl.clip(a).unwrap();
+        assert_eq!(ca.in_point, ca.out_point);
+        // missing clip → false
+        assert!(!tl.ripple_delete(999));
+        assert!(!tl.trim_clip(999, false, 1.0));
+    }
+
+    #[test]
+    fn rate_media_at_and_sanitize() {
+        let mut c = Clip::media("a.mp4", 2.0, 6.0, 0.0);
+        c.rate = 2.0;
+        assert_eq!(c.media_at(1.0), 4.0); // in + local*rate
+        c.rate = f64::NAN;
+        c.sanitize();
+        assert_eq!(c.rate, 1.0);
+        c.rate = 1000.0;
+        c.sanitize();
+        assert_eq!(c.rate, 20.0);
+        // eq/comp survive serde round-trip as camelCase
+        c.eq = Some(Eq {
+            low: 3.0,
+            mid: 0.0,
+            high: -2.0,
+        });
+        let j = serde_json::to_value(&c).unwrap();
+        assert_eq!(j["eq"]["low"], 3.0);
+        let back: Clip = serde_json::from_value(j).unwrap();
+        assert_eq!(back.eq.unwrap().high, -2.0);
     }
 }

@@ -53,6 +53,9 @@ impl TlSession {
             "tl.addCue",
             "tl.setCue",
             "tl.removeCue",
+            "tl.rippleDelete",
+            "tl.rippleInsert",
+            "tl.trim",
             "tl.probe",
             "tl.renderFrame",
             "tl.render",
@@ -211,6 +214,58 @@ impl TlSession {
                 let id = req_u64(v, "clip")?;
                 let new_id = self.tl()?.duplicate_clip(id)?;
                 Ok(json!({"clipId": new_id}))
+            }
+            "tl.rippleDelete" => {
+                let id = req_u64(v, "clip")?;
+                if !self.tl()?.ripple_delete(id) {
+                    anyhow::bail!("clip {id} not found");
+                }
+                Ok(json!("ok"))
+            }
+            "tl.rippleInsert" => {
+                // same clip params as tl.addClip, but later clips shift right
+                let track = req_u64(v, "track")? as usize;
+                let src = v.get("src").and_then(Value::as_str).unwrap_or("");
+                let text = v.get("text").and_then(Value::as_str);
+                if src.is_empty() && text.is_none() {
+                    anyhow::bail!("tl.rippleInsert needs 'src' (media) or 'text' (text clip)");
+                }
+                let in_p = opt_f64(v, "in", 0.0);
+                let out_p = match v.get("out").and_then(Value::as_f64) {
+                    Some(o) => o,
+                    None => {
+                        if text.is_some() && src.is_empty() {
+                            in_p + opt_f64(v, "dur", 3.0)
+                        } else {
+                            return Err(anyhow::anyhow!("missing param 'out'"));
+                        }
+                    }
+                };
+                if out_p <= in_p {
+                    anyhow::bail!("clip out ({out_p}) must be > in ({in_p})");
+                }
+                let offset = opt_f64(v, "offset", 0.0);
+                let mut clip = Clip::media(src, in_p, out_p, offset);
+                if let Some(t) = text {
+                    clip.text = Some(t.to_string());
+                }
+                apply_clip_params(&mut clip, v)?;
+                let id = self.tl()?.ripple_insert(track, clip)?;
+                Ok(json!({"clipId": id}))
+            }
+            "tl.trim" => {
+                let id = req_u64(v, "clip")?;
+                let edge = v.get("edge").and_then(Value::as_str).unwrap_or("out");
+                let delta = req_f64(v, "delta")?;
+                let edge_in = match edge {
+                    "in" => true,
+                    "out" => false,
+                    other => anyhow::bail!("tl.trim edge must be 'in' or 'out', got '{other}'"),
+                };
+                if !self.tl()?.trim_clip(id, edge_in, delta) {
+                    anyhow::bail!("clip {id} not found");
+                }
+                Ok(json!("ok"))
             }
             "tl.setCue" => {
                 let idx = req_u64(v, "index")? as usize;
@@ -583,7 +638,7 @@ pub fn command_specs() -> Vec<Value> {
         spec("tl.setTrack", "Edit a track (name, muted)", json!({"track": n("track index"), "name": s("name"), "muted": b("muted")}), &["track"]),
         spec("tl.removeTrack", "Remove a track and everything on it", json!({"track": n("track index")}), &["track"]),
         spec("tl.addClip", "Add a clip to a track — media via 'src' (needs 'out'), text via 'text' (optional 'dur')", json!({"track": n("track index"), "src": s("media path"), "text": s("text clip content"), "in": n("source in sec"), "out": n("source out sec"), "dur": n("text clip seconds"), "offset": n("timeline offset sec")}), &["track"]),
-        spec("tl.setClip", "Edit a clip (in/out/offset/opacity/scale/x/y/volume/fadeIn/fadeOut — scalars or keyframe [[t,v]] lists; volume v in 0..=2. transIn/transOut: {type:'slide'|'wipe'|'dip', dur:sec, color?:[r,g,b,a] 0-1} or null to clear — a set transition replaces that edge's fadeIn/fadeOut; slide/wipe animate position (wipe = slide for now), dip fades through color)", json!({"clip": n("clip id"), "in": n("source in sec"), "out": n("source out sec"), "offset": n("timeline offset sec"), "opacity": json!({"description": "scalar or [[t,v]] keyframes, 0..=1"}), "scale": json!({"description": "scalar or [[t,v]] keyframes"}), "x": json!({"description": "scalar or [[t,v]] keyframes, px right of centre"}), "y": json!({"description": "scalar or [[t,v]] keyframes, px below centre"}), "volume": json!({"description": "scalar or [[t,v]] keyframes, gain 0..=2"}), "fadeIn": n("fade-in sec"), "fadeOut": n("fade-out sec"), "transIn": json!({"type": "object", "description": "{type:'slide'|'wipe'|'dip', dur:sec, color?:[r,g,b,a]}", "properties": {"type": s("slide|wipe|dip"), "dur": n("sec"), "color": json!({"type": "array", "description": "[r,g,b,a] 0..=1 (dip only)"})}, "required": ["type", "dur"]}), "transOut": json!({"type": "object", "description": "same shape as transIn", "properties": {"type": s("slide|wipe|dip"), "dur": n("sec"), "color": json!({"type": "array", "description": "[r,g,b,a] 0..=1 (dip only)"})}, "required": ["type", "dur"]}), "text": s("text clip content")}), &["clip"]),
+        spec("tl.setClip", "Edit a clip (in/out/offset/opacity/scale/x/y/volume/fadeIn/fadeOut — scalars or keyframe [[t,v]] lists; volume v in 0..=2. transIn/transOut: {type:'slide'|'wipe'|'dip', dur:sec, color?:[r,g,b,a] 0-1} or null to clear — a set transition replaces that edge's fadeIn/fadeOut; slide/wipe animate position (wipe = slide for now), dip fades through color)", json!({"clip": n("clip id"), "in": n("source in sec"), "out": n("source out sec"), "offset": n("timeline offset sec"), "opacity": json!({"description": "scalar or [[t,v]] keyframes, 0..=1"}), "scale": json!({"description": "scalar or [[t,v]] keyframes"}), "x": json!({"description": "scalar or [[t,v]] keyframes, px right of centre"}), "y": json!({"description": "scalar or [[t,v]] keyframes, px below centre"}), "volume": json!({"description": "scalar or [[t,v]] keyframes, gain 0..=2"}), "fadeIn": n("fade-in sec"), "fadeOut": n("fade-out sec"), "transIn": json!({"type": "object", "description": "{type:'slide'|'wipe'|'dip', dur:sec, color?:[r,g,b,a]}", "properties": {"type": s("slide|wipe|dip"), "dur": n("sec"), "color": json!({"type": "array", "description": "[r,g,b,a] 0..=1 (dip only)"})}, "required": ["type", "dur"]}), "transOut": json!({"type": "object", "description": "same shape as transIn", "properties": {"type": s("slide|wipe|dip"), "dur": n("sec"), "color": json!({"type": "array", "description": "[r,g,b,a] 0..=1 (dip only)"})}, "required": ["type", "dur"]}), "text": s("text clip content"), "rate": n("playback rate: 1=realtime, 2=2x, 0.5=slow-mo; retimes media inside the same clip span"), "eq": json!({"type": "object", "description": "3-band EQ {low,mid,high} dB, or null to clear", "properties": {"low": n("dB @120Hz"), "mid": n("dB @1kHz"), "high": n("dB @8kHz")}}), "comp": json!({"type": "object", "description": "compressor {threshold(dB), ratio, attack(ms), release(ms), makeup(dB)}, or null to clear", "properties": {"threshold": n("dB <=0"), "ratio": n("compression ratio"), "attack": n("ms"), "release": n("ms"), "makeup": n("dB")}})}), &["clip"]),
         spec("tl.removeClip", "Remove a clip", json!({"clip": n("clip id")}), &["clip"]),
         spec("tl.splitClip", "Split a clip at timeline second t into two clips", json!({"clip": n("clip id"), "t": n("timeline sec")}), &["clip", "t"]),
         spec("tl.duplicateClip", "Clone a clip onto its track right after the original", json!({"clip": n("clip id")}), &["clip"]),
@@ -596,6 +651,9 @@ pub fn command_specs() -> Vec<Value> {
         spec("tl.detectSilence", "ffmpeg silencedetect on a media file → [{start,end}]", json!({"path": s("media path"), "thresholdDB": n("dB, default -35"), "minDur": n("sec, default 0.5")}), &["path"]),
         spec("tl.generateClip", "Generate a clip with a minimax-h3 h3ui-style backend and add it. endpoint is restricted to loopback hosts (127.x, ::1, localhost) unless allowRemote=true", json!({"endpoint": s("backend base URL, default http://127.0.0.1:8000; loopback only"), "allowRemote": b("allow a non-loopback endpoint (SSRF override)"), "prompt": s("generation prompt"), "track": n("track index; default = first video track, created if none"), "size": s("resolution"), "length": n("seconds"), "quality": s("quality"), "seed": n("rng seed"), "out": s("download path"), "offset": n("timeline offset sec; default = after last clip on the track"), "timeoutSecs": n("poll timeout, default 1800")}), &["prompt"]),
         spec("tl.duck", "Duck a track's audio under subtitle cues: inserts volume keyframes on every non-text clip of the track so gain dips to `amount` while any cue on cueTrack (default: first subtitle track) is active — down-ramp `attack` s before, up-ramp `release` s after", json!({"track": n("video/audio track index to duck"), "cueTrack": n("subtitle track index; default = first"), "amount": n("gain during cues, default 0.25"), "attack": n("fade-down sec, default 0.15"), "release": n("fade-up sec, default 0.3")}), &["track"]),
+        spec("tl.rippleDelete", "Remove a clip and close the gap: every later clip on the same track shifts left by its duration", json!({"clip": n("clip id")}), &["clip"]),
+        spec("tl.rippleInsert", "Insert a clip (same params as tl.addClip) pushing every clip at or after 'offset' on the track right by its duration", json!({"track": n("track index"), "src": s("media path"), "text": s("text clip content"), "in": n("source in sec"), "out": n("source out sec"), "dur": n("text clip seconds"), "offset": n("timeline offset sec")}), &["track"]),
+        spec("tl.trim", "Trim a clip edge by delta sec (positive extends): edge 'in' moves the source start (clip keeps offset, shortens from the left); edge 'out' extends/cuts the end", json!({"clip": n("clip id"), "edge": s("'in' or 'out' (default 'out')"), "delta": n("seconds, signed")}), &["clip", "delta"]),
     ]
 }
 
@@ -676,6 +734,28 @@ fn apply_clip_params(clip: &mut Clip, v: &Value) -> Result<()> {
             t.as_str().map(str::to_string)
         };
     }
+    if let Some(r) = v.get("rate").and_then(Value::as_f64) {
+        clip.rate = r;
+    }
+    if let Some(val) = v.get("eq") {
+        clip.eq = if val.is_null() {
+            None
+        } else {
+            Some(
+                serde_json::from_value(val.clone())
+                    .with_context(|| format!("bad 'eq' — expected {{low, mid, high}} dB"))?,
+            )
+        };
+    }
+    if let Some(val) = v.get("comp") {
+        clip.comp = if val.is_null() {
+            None
+        } else {
+            Some(serde_json::from_value(val.clone()).with_context(|| {
+                format!("bad 'comp' — expected {{threshold, ratio, attack, release, makeup}}")
+            })?)
+        };
+    }
     if clip.out_point <= clip.in_point {
         anyhow::bail!(
             "clip out ({}) must be > in ({})",
@@ -727,6 +807,9 @@ mod tests {
             "tl.addCue",
             "tl.setCue",
             "tl.removeCue",
+            "tl.rippleDelete",
+            "tl.rippleInsert",
+            "tl.trim",
             "tl.probe",
             "tl.renderFrame",
             "tl.render",
@@ -736,7 +819,7 @@ mod tests {
         ] {
             assert!(ids.contains(&c), "missing {c}");
         }
-        assert_eq!(ids.len(), 21);
+        assert_eq!(ids.len(), 24);
     }
 
     #[test]

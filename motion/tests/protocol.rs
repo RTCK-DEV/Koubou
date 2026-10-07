@@ -66,7 +66,7 @@ fn dispatch(s: &mut TlSession, v: Value) -> Value {
 #[test]
 fn doc_cycle_and_duration() {
     let mut s = TlSession::new();
-    assert_eq!(TlSession::command_ids().len(), 21);
+    assert_eq!(TlSession::command_ids().len(), 24);
     dispatch(
         &mut s,
         json!({"id": "tl.new", "w": 320, "h": 240, "fps": 24, "name": "doc"}),

@@ -46,6 +46,9 @@ final class MotionStore: ObservableObject {
         var volume: [[Double]]
         var transIn: TlTrans?
         var transOut: TlTrans?
+        var rate: Double
+        var eq: [Double]    // low, mid, high (dB)
+        var comp: [Double]  // threshold, ratio, attack, release, makeup
         var dur: Double { max(0.01, outPoint - inPoint) }
         var label: String { src.isEmpty ? "clip" : URL(fileURLWithPath: src).deletingPathExtension().lastPathComponent }
     }
@@ -142,7 +145,14 @@ final class MotionStore: ObservableObject {
                     fadeOut: (c["fadeOut"] as? NSNumber)?.doubleValue ?? 0,
                     volume: (c["volume"] as? [[NSNumber]] ?? []).map { $0.map { $0.doubleValue } },
                     transIn: parseTrans(c["transIn"]),
-                    transOut: parseTrans(c["transOut"]))
+                    transOut: parseTrans(c["transOut"]),
+                    rate: (c["rate"] as? NSNumber)?.doubleValue ?? 1.0,
+                    eq: ["low", "mid", "high"].compactMap {
+                        ((c["eq"] as? [String: Any])?[$0] as? NSNumber)?.doubleValue
+                    },
+                    comp: ["threshold", "ratio", "attack", "release", "makeup"].compactMap {
+                        ((c["comp"] as? [String: Any])?[$0] as? NSNumber)?.doubleValue
+                    })
             }
             return TlTrack(id: i, kind: t["kind"] as? String ?? "video",
                            muted: t["muted"] as? Bool ?? false,
@@ -197,6 +207,42 @@ final class MotionStore: ObservableObject {
         guard let id = selectedClip else { return }
         dispatch(["id": "tl.removeClip", "clip": id])
         selectedClip = nil
+    }
+
+    /// remove the selected clip and close the gap on its track
+    func rippleDelete() {
+        guard let id = selectedClip else { return }
+        dispatch(["id": "tl.rippleDelete", "clip": id])
+        selectedClip = nil
+    }
+
+    /// trim the selected clip edge by delta seconds (positive extends)
+    func trimClip(edge: String, delta: Double) {
+        guard let id = selectedClip else { return }
+        dispatch(["id": "tl.trim", "clip": id, "edge": edge, "delta": delta],
+                 then: .preview)
+    }
+
+    /// push one EQ band on the selected clip (dB); sends the full 3-band
+    /// dict so partial edits don't drop other bands
+    func setEq(band: Int, gain: Double) {
+        guard let id = selectedClip,
+              let c = tracks.flatMap(\.clips).first(where: { $0.id == id }) else { return }
+        var e = c.eq
+        while e.count < 3 { e.append(0) }
+        e[band] = gain
+        setClip(id, ["eq": ["low": e[0], "mid": e[1], "high": e[2]]])
+    }
+
+    /// push one compressor field on the selected clip
+    func setComp(field: Int, value: Double) {
+        guard let id = selectedClip,
+              let c = tracks.flatMap(\.clips).first(where: { $0.id == id }) else { return }
+        var k = c.comp.isEmpty ? [-18.0, 4.0, 5.0, 120.0, 0.0] : c.comp
+        while k.count < 5 { k.append(0) }
+        k[field] = value
+        setClip(id, ["comp": ["threshold": k[0], "ratio": k[1], "attack": k[2],
+                              "release": k[3], "makeup": k[4]]])
     }
 
     func exportMovie() {
@@ -465,6 +511,16 @@ struct MotionView: View {
                         kv("Offset", c.offset) { m.setClip(id, ["offset": $0]) }
                         kv("Fade in", c.fadeIn) { m.setClip(id, ["fadeIn": $0]) }
                         kv("Fade out", c.fadeOut) { m.setClip(id, ["fadeOut": $0]) }
+                        kv("Rate", c.rate) { m.setClip(id, ["rate": $0]) }
+                        HStack(spacing: 6) {
+                            Text("Trim").font(.caption).foregroundStyle(.secondary)
+                            ForEach([("in", "In"), ("out", "Out")], id: \.0) { (edge, lab) in
+                                Button("\(lab) −") { m.trimClip(edge: edge, delta: -0.5) }
+                                    .buttonStyle(KouSecondaryButton())
+                                Button("\(lab) +") { m.trimClip(edge: edge, delta: 0.5) }
+                                    .buttonStyle(KouSecondaryButton())
+                            }
+                        }
                     }
                     Panel("Transitions") {
                         transitionEdge(id, edge: "In", key: "transIn", cur: c.transIn)
@@ -472,6 +528,24 @@ struct MotionView: View {
                     }
                     Panel("Audio") {
                         volumeEditor(c)
+                        Text("EQ (dB)").font(.caption2).foregroundStyle(.secondary)
+                        HStack(spacing: 6) {
+                            ForEach(0..<3, id: \.self) { i in
+                                let lab = ["Lo", "Mid", "Hi"][i]
+                                kv(lab, c.eq.indices.contains(i) ? c.eq[i] : 0) {
+                                    m.setEq(band: i, gain: $0)
+                                }
+                            }
+                        }
+                        Text("Compressor").font(.caption2).foregroundStyle(.secondary)
+                        HStack(spacing: 6) {
+                            kv("Thr", c.comp.indices.contains(0) ? c.comp[0] : -18) {
+                                m.setComp(field: 0, value: $0)
+                            }
+                            kv("Ratio", c.comp.indices.contains(1) ? c.comp[1] : 4) {
+                                m.setComp(field: 1, value: $0)
+                            }
+                        }
                         ToolChip(label: "Duck under subtitles", icon: "chevron.down.circle") {
                             m.duckSelected()
                         }
@@ -491,6 +565,8 @@ struct MotionView: View {
                             }
                         }
                         Button("Remove Clip", role: .destructive) { m.removeClip() }
+                            .buttonStyle(KouSecondaryButton())
+                        Button("Ripple Delete", role: .destructive) { m.rippleDelete() }
                             .buttonStyle(KouSecondaryButton())
                     }
                 } else {

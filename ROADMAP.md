@@ -39,10 +39,16 @@ polish isn't:
   during event tracking)
 - ✅ Groups: disclosure nesting, ⌘-click multi-select, group/ungroup,
   drag reorder + reparent in the layers panel (`doc.moveLayer`)
+- ✅ Canvas pan/zoom: scroll-wheel pan, ⌘+scroll zoom about cursor, pinch
+  zoom, spacebar drag-pan, toolbar −/+ and % menu (⌘0/⌘=/⌘-)
+- ✅ Vector node editing: double-click a shape → anchor handles
+  (line=circle, curve=square), drag to move via `doc.shapeNodes`/
+  `doc.moveNode`, Esc exits
+- ✅ Mask UX improved: Invert chip + brush softness slider in the mask
+  panel (`doc.maskInvert`, `softness` on `doc.maskPaint`)
 - 🟡 Layer styles: drop shadow only (glow/stroke/bevel missing); no
   layered PSD export (flat only)
-- ❌ Smart objects, channel ops, filter gallery, liquify, text-on-path,
-  canvas pan/zoom (fit-only)
+- ❌ Smart objects, channel ops, filter gallery, liquify, text-on-path
 
 **vs the storytold craft suite** — one app now spans all seven domains:
 
@@ -68,8 +74,12 @@ polish isn't:
   in, and every command now carries a generated MCP tool spec (single
   registry, no schema drift) + atomic `batch`; still no persisted command
   journal or xtask-style CI harness
-- ❌ No path boolean ops/node editing, no PDF annotation/preflight, no
-  speed ramps or GPU realtime playback — the deep ends of each domain
+- ✅ Motion edit depth: ripple ops (`tl.rippleDelete`/`tl.rippleInsert`),
+  edge trims (`tl.trim`), constant playback rate (`rate` → setpts retime +
+  chained atempo), per-clip 3-band EQ + compressor (`eq`/`comp` → ffmpeg
+  equalizer/acompressor) — all with inspector UI
+- ❌ No path boolean ops, no PDF annotation/preflight, no speed ramps or
+  GPU realtime playback — the deep ends of each domain
 
 ## Where we're going (ordered)
 
@@ -77,13 +87,13 @@ polish isn't:
 2. **Layered PSD export** — a real writer that keeps layers, not the
    current flat composite
 3. **Layer styles** — glow, stroke, bevel beyond today's drop shadow
-4. **Canvas pan/zoom** — fit-only today; needs scroll zoom + spacebar pan
-5. **Vector node editing** — boolean ops, path point handles, SVG import
-6. **Ripple editing + speed ramps**, real playback in Motion
-7. **EQ/comp UI in Motion** — per-clip audio filters (params exist)
-8. **xtask CI** — fmt/clippy/layers/parity in one command (today:
+4. **Boolean vector ops + SVG import/export**
+5. **Speed ramps** — constant rate landed (`tl.setClip rate`); ramps
+   = split + per-clip rate until keyframed rate exists
+6. **Real playback in Motion** — GPU realtime instead of frame stepping
+7. **xtask CI** — fmt/clippy/layers/parity in one command (today:
    `scripts/parity_check.sh` + `cargo test --workspace`)
-9. **Batch ops** — scan folder → apply recipe → export, via the CLI/MCP
+8. **Batch ops** — scan folder → apply recipe → export, via the CLI/MCP
 
 ## Engineering notes
 

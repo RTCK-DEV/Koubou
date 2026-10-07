@@ -64,7 +64,7 @@ fn frame_for_clip(tl: &Timeline, clip: &Clip, local: f64) -> Result<RgbaImage> {
         let text = clip.text.as_deref().unwrap_or("");
         return text::rasterize(text, tl.h as f32 * TEXT_PX as f32, 1.0);
     }
-    let media_t = clip.in_point + local;
+    let media_t = clip.media_at(local);
     if ffmpeg::is_image_src(&clip.src) {
         return image::open(&clip.src)
             .map(|i| i.to_rgba8())
@@ -144,6 +144,8 @@ struct VisualElement {
     /// in/out transitions (None on subtitle + dip-underlay elements)
     trans_in: Option<crate::model::Transition>,
     trans_out: Option<crate::model::Transition>,
+    /// playback rate (1 = realtime); retimes the input via setpts
+    rate: f64,
     /// subtitle cue: pinned bottom-centre instead of x/y keyframes
     is_subtitle: bool,
 }
@@ -157,6 +159,10 @@ struct AudioElement {
     fade_out: f64,
     /// volume keyframes (clip-local seconds, gain 0..=2)
     volume: Vec<[f64; 2]>,
+    /// playback rate — audio retimed via chained atempo (0.5..=2 each)
+    rate: f64,
+    eq: Option<crate::model::Eq>,
+    comp: Option<crate::model::Comp>,
 }
 
 /// render the whole timeline to `out` (mp4). `burn_subs` bakes subtitle cues
@@ -227,7 +233,8 @@ fn render_inner(
             } else if ffmpeg::is_image_src(&clip.src) {
                 push_image_src_input(&mut inputs, &clip.src, dur, fps);
             } else {
-                push_media_input(&mut inputs, &clip.src, clip.in_point, dur);
+                // rate consumes source faster — the input slice is dur*rate
+                push_media_input(&mut inputs, &clip.src, clip.in_point, dur * clip.rate);
             }
             // dip transitions need a solid-colour underlay element during
             // their window — emitted right before the clip so it sits under
@@ -257,6 +264,7 @@ fn render_inner(
                     fade_out: 0.0,
                     trans_in: None,
                     trans_out: None,
+                    rate: 1.0,
                     is_subtitle: false,
                 });
             }
@@ -272,6 +280,7 @@ fn render_inner(
                 fade_out: clip.fade_out,
                 trans_in: clip.trans_in.clone(),
                 trans_out: clip.trans_out.clone(),
+                rate: clip.rate,
                 is_subtitle: false,
             });
         }
@@ -306,6 +315,7 @@ fn render_inner(
                     fade_out: 0.0,
                     trans_in: None,
                     trans_out: None,
+                    rate: 1.0,
                     is_subtitle: true,
                 });
             }
@@ -329,7 +339,7 @@ fn render_inner(
         }
         let input = input_count;
         input_count += 1;
-        push_media_input(&mut inputs, &clip.src, clip.in_point, dur);
+        push_media_input(&mut inputs, &clip.src, clip.in_point, dur * clip.rate);
         audios.push(AudioElement {
             input,
             offset: clip.offset,
@@ -337,6 +347,9 @@ fn render_inner(
             fade_in: clip.fade_in,
             fade_out: clip.fade_out,
             volume: clip.volume.clone(),
+            rate: clip.rate,
+            eq: clip.eq.clone(),
+            comp: clip.comp.clone(),
         });
     }
 
@@ -438,10 +451,21 @@ fn build_graph(
             Some(_) => 0.0,
             None => el.fade_out,
         };
+        // rate != 1 retimes the input: divide pts to fit dur*rate source
+        // into dur output seconds (rate 1 keeps the legacy setpts string).
+        let pts = if (el.rate - 1.0).abs() < 1e-9 {
+            format!("setpts=PTS-STARTPTS+{}/TB", fmt6(el.offset))
+        } else {
+            format!(
+                "setpts=(PTS-STARTPTS)/{}+{}/TB",
+                fmt6(el.rate),
+                fmt6(el.offset)
+            )
+        };
         let mut chain = format!(
-            "[{}:v]setpts=PTS-STARTPTS+{}/TB,fps={},scale=w='iw*{}':h='ih*{}':eval=frame:flags=lanczos,format=rgba",
+            "[{}:v]{},fps={},scale=w='iw*{}':h='ih*{}':eval=frame:flags=lanczos,format=rgba",
             el.input,
-            fmt6(el.offset),
+            pts,
             fmt6(fps),
             se,
             se
@@ -524,6 +548,43 @@ fn build_graph(
                 "[{}:a]asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo",
                 a.input
             );
+            // rate: atempo accepts 0.5..=2 per instance — chain them
+            if (a.rate - 1.0).abs() > 1e-9 {
+                for f in atempo_chain(a.rate) {
+                    chain.push_str(&format!(",atempo={f}"));
+                }
+            }
+            if let Some(eq) = &a.eq {
+                if eq.low != 0.0 {
+                    chain.push_str(&format!(
+                        ",equalizer=f=120:t=h:width=800:g={}",
+                        fmt6(eq.low)
+                    ));
+                }
+                if eq.mid != 0.0 {
+                    chain.push_str(&format!(
+                        ",equalizer=f=1000:t=h:width=900:g={}",
+                        fmt6(eq.mid)
+                    ));
+                }
+                if eq.high != 0.0 {
+                    chain.push_str(&format!(
+                        ",equalizer=f=8000:t=h:width=9000:g={}",
+                        fmt6(eq.high)
+                    ));
+                }
+            }
+            if let Some(cp) = &a.comp {
+                // acompressor takes level_in (linear, 1=unity) as first param
+                chain.push_str(&format!(
+                    ",acompressor=level_in=1:threshold={}:ratio={}:attack={}:release={}:makeup={}",
+                    fmt6(cp.threshold),
+                    fmt6(cp.ratio),
+                    fmt6(cp.attack),
+                    fmt6(cp.release),
+                    fmt6(cp.makeup.max(1.0))
+                ));
+            }
             if !a.volume.is_empty() {
                 // clip-local clock (asetpts already reset) — before afade so
                 // authored fades still apply on top of the gain curve
@@ -557,6 +618,27 @@ fn build_graph(
         }
     }
     g
+}
+
+/// split a tempo factor into atempo-compatible factors (each 0.5..=2.0)
+fn atempo_chain(rate: f64) -> Vec<f64> {
+    let mut fs = Vec::new();
+    let mut r = rate;
+    let mut guard = 0;
+    while r > 2.0 && guard < 8 {
+        fs.push(2.0);
+        r /= 2.0;
+        guard += 1;
+    }
+    while r < 0.5 && guard < 16 {
+        fs.push(0.5);
+        r /= 0.5;
+        guard += 1;
+    }
+    if (r - 1.0).abs() > 1e-9 {
+        fs.push(r);
+    }
+    fs
 }
 
 fn push_media_input(inputs: &mut Vec<String>, src: &str, in_point: f64, dur: f64) {
@@ -628,6 +710,7 @@ mod tests {
             fade_out: 0.0,
             trans_in: None,
             trans_out: None,
+            rate: 1.0,
             is_subtitle: false,
         }
     }
@@ -691,6 +774,54 @@ mod tests {
     }
 
     #[test]
+    fn rate_retimes_the_input() {
+        let mut e = el(0.0, 4.0);
+        e.rate = 2.0;
+        let g = build_graph(320, 240, 8.0, 24.0, &[e], &[]);
+        assert!(
+            g.contains("setpts=(PTS-STARTPTS)/2.000000+0.000000/TB"),
+            "rate 2 didn't retime:\n{g}"
+        );
+    }
+
+    #[test]
+    fn atempo_eq_comp_in_audio_chain() {
+        use crate::model::{Comp, Eq};
+        let a = AudioElement {
+            input: 0,
+            offset: 0.0,
+            dur: 3.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            volume: Vec::new(),
+            rate: 4.0,
+            eq: Some(Eq {
+                low: 3.0,
+                mid: -2.0,
+                high: 0.0,
+            }),
+            comp: Some(Comp {
+                threshold: -18.0,
+                ratio: 4.0,
+                attack: 5.0,
+                release: 120.0,
+                makeup: 3.0,
+            }),
+        };
+        let g = build_graph(320, 240, 5.0, 24.0, &[], &[a]);
+        assert!(g.contains("atempo=2"), "{g}");
+        assert!(g.contains("equalizer=f=120"), "{g}");
+        assert!(g.contains("equalizer=f=1000"), "{g}");
+        assert!(!g.contains("equalizer=f=8000"), "{g}");
+        assert!(g.contains("acompressor="), "{g}");
+        assert!(g.contains("threshold=-18.000000"), "{g}");
+        assert_eq!(atempo_chain(4.0), vec![2.0, 2.0]);
+        assert_eq!(atempo_chain(0.5), vec![0.5]);
+        assert_eq!(atempo_chain(0.25), vec![0.5, 0.5]);
+        assert_eq!(atempo_chain(1.0), Vec::<f64>::new());
+    }
+
+    #[test]
     fn volume_filter_before_afade() {
         let a = AudioElement {
             input: 3,
@@ -699,6 +830,9 @@ mod tests {
             fade_in: 0.2,
             fade_out: 0.0,
             volume: vec![[1.0, 1.0], [2.0, 0.25]],
+            rate: 1.0,
+            eq: None,
+            comp: None,
         };
         let g = build_graph(320, 240, 5.0, 24.0, &[], &[a]);
         assert!(g.contains("volume=volume='"), "{g}");

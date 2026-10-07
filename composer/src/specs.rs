@@ -112,6 +112,8 @@ pub fn base() -> Vec<Value> {
         spec("doc.addShape", "Append a shape to a shape layer (gen: rect|roundRect|ellipse|star|line, or d)", json!({"layer": n("layer id"), "gen": s("shape generator"), "d": s("svg path"), "fill": {"type": "array", "description": "[r,g,b,a]"}, "stroke": o("{color,width,dash?}")}), &["layer"]),
         spec("doc.shapeSet", "Edit one shape on a shape layer by index (d/gen/fill/stroke/removeFill/removeStroke)", json!({"layer": n("layer id"), "index": n("shape index")}), &["layer", "index"]),
         spec("doc.shapeRemove", "Remove one shape from a shape layer by index", json!({"layer": n("layer id"), "index": n("shape index")}), &["layer", "index"]),
+        spec("doc.shapeNodes", "List the editable anchor nodes of a shape layer's paths (flat index across shapes; kind l|c|q)", json!({"layer": n("layer id")}), &["layer"]),
+        spec("doc.moveNode", "Move anchor node `index` of a shape layer to doc coords (x,y); adjacent control handles ride along", json!({"layer": n("layer id"), "index": n("flat node index"), "x": n("doc x"), "y": n("doc y")}), &["layer", "index", "x", "y"]),
         spec("doc.undo", "Undo the last document mutation", json!({}), &[]),
         spec("doc.redo", "Redo the last undone document mutation", json!({}), &[]),
         // ---- history for delegated domains is handled by Session itself ----

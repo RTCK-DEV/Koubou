@@ -52,7 +52,7 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | Layer stack (add/remove/reorder/select/duplicate/reparent) | ✅ | `cmd:doc.addLayer`, `doc.removeLayer`, `doc.reorder`, `doc.moveLayer`, `doc.setLayer`, `doc.duplicateLayer` + panel drag/drop |
 | Opacity + visibility | ✅ | `doc.setLayer` |
 | Blend modes — 27 per PDF/W3C | ✅ | `BlendMode`; `Dissolve` falls back to normal (🟡) |
-| Layer masks (paint, density, feather, invert) | ✅ | `cmd:doc.maskPaint`, `doc.maskInvert` + `Layer.mask` |
+| Layer masks (paint, density, feather, invert) | ✅ | `cmd:doc.maskPaint`, `doc.maskInvert`, `doc.maskRect` + `Layer.mask`; brush softness slider in the mask panel |
 | Develop layers (live RAW develop inside stack) | ✅ | `doc.addLayer kind=develop` |
 | Adjustment layers (full recipe over the stack below) | ✅ | `doc.addLayer kind=adjustment` |
 | Fill layers (solid/linear gradient) | ✅ | `doc.addLayer kind=fill/gradient` |
@@ -65,7 +65,7 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | Full-res export + preview render | ✅ | `cmd:doc.render` (PNG/JPEG/TIFF, `format`+`quality` params), `doc.exportLayer` |
 | PSD import (layers, blend modes, masks→flattened) | ✅ | `doc.importPsd` / `koubou-cli psd` |
 | PSD export | 🟡 | `cmd:doc.exportPsd` — flattened composite, no layer preservation |
-| Canvas: pan/zoom | 🟡 | fit-to-view only |
+| Canvas: pan/zoom | ✅ | scroll-wheel pan, ⌘+scroll zoom about cursor, pinch zoom, spacebar drag-pan, toolbar −/+ and % menu (Fit ⌘0, 50–400%) |
 | Canvas: drag-move, transform handles, marquee | ✅ | `cmd:doc.pick`, `doc.bounds` + canvas gestures (alpha-precise pick, corner scale handles, marquee → selectedSet) |
 | On-canvas text editing | ✅ | double-click a text layer → in-place editor (Esc commits) |
 | Undo/redo (all domains, ⌘Z in-app) | ✅ | `cmd:doc.undo`, `doc.redo`, `tl.undo`, `tl.redo`, `pg.undo`, `pg.redo` — snapshot stacks, cap 32 |
@@ -94,10 +94,10 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 ## Top gaps (ordered by user impact)
 
 1. Mask UX (thumbnail, gradient tool, mask view)
-2. Layered PSD export (composite-only today)
-3. Layer styles beyond drop shadow (glow, stroke, bevel)
-4. Canvas pan/zoom (fit-to-view only)
-5. Boolean vector ops / node editing
+2. Layered PSD export (composite-only today — layered writer in flight)
+3. Layer styles beyond drop shadow (glow/stroke/bevel in flight)
+4. Boolean vector ops / SVG import-export
+5. Speed ramps (rate is constant per clip today; ramps = split+rate)
 
 ## Vector / design (vectorcraft)
 
@@ -105,7 +105,8 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 |---|---|---|
 | Shape layers with SVG `d` paths | ✅ | `doc.addLayer kind=shape` |
 | Parametric generators + dash strokes | ✅ | `cmd:doc.addShape`, `doc.shapeSet`, `doc.shapeRemove` |
-| Boolean ops, path editor, node tools | ❌ | — |
+| Boolean ops | ❌ | — |
+| Node editing (path point handles) | ✅ | `cmd:doc.shapeNodes` (read anchors), `cmd:doc.moveNode` — double-click a shape → anchor handles (circle=line, square=curve), drag to move, Esc exits |
 | SVG import/export, artboards | ❌ | — |
 
 ## Motion / effects (filmcraft + effectcraft)
@@ -121,8 +122,10 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | Generative clip insert (minimax-h3 endpoint) | ✅ | `tl.generateClip` |
 | Speech-to-subtitle (Speech framework) | ✅ | app (SFSpeechRecognizer → `tl.addCue`) |
 | Audio: per-clip volume keyframes + auto-duck under cues | ✅ | `tl.setClip volume`, `cmd:tl.duck` |
-| Transitions (slide/wipe/dip per clip edge) | 🟡 | `tl.setClip transIn/transOut` — no speed ramp/multicam |
-| EQ/comp per clip | 🟡 | ffmpeg af params |
+| Transitions (slide/wipe/dip per clip edge) | 🟡 | `tl.setClip transIn/transOut` — no multicam |
+| Ripple ops + edge trim | ✅ | `cmd:tl.rippleDelete`, `tl.rippleInsert`, `tl.trim` + UI trim ±/Ripple Delete buttons |
+| Playback rate (constant per clip) | ✅ | `tl.setClip rate` — setpts retime + chained atempo; clip keeps its span, source consumed faster/slower |
+| EQ/comp per clip | ✅ | `tl.setClip eq={low,mid,high}dB`, `comp={threshold,ratio,attack,release,makeup}` → ffmpeg equalizer×3 + acompressor; inspector sliders |
 | GPU realtime playback | ❌ | frame-by-frame only |
 
 ## Pages / layout (designcraft)

@@ -371,6 +371,8 @@ impl Session {
             "doc.addShape",
             "doc.shapeSet",
             "doc.shapeRemove",
+            "doc.shapeNodes",
+            "doc.moveNode",
             "doc.undo",
             "doc.redo",
             // cross-domain undo routing is owned by this session
@@ -849,6 +851,50 @@ impl Session {
                 }
                 l.gen += 1;
                 Ok(json!("ok"))
+            }
+            "doc.shapeNodes" => {
+                let c = self.composer.as_ref().context("no document")?;
+                let id = layer_id(v)?;
+                let l = c.doc.layer(id).context("layer not found")?;
+                let shapes = match &l.kind {
+                    LayerKind::Shape { shapes } => shapes,
+                    _ => anyhow::bail!("layer {id} is not a shape layer"),
+                };
+                let mut nodes = Vec::new();
+                for (si, s) in shapes.iter().enumerate() {
+                    for (x, y, k) in crate::shape::path_nodes(&s.d).unwrap_or_default() {
+                        nodes.push(json!({"x": x, "y": y, "kind": k.to_string(), "shape": si}));
+                    }
+                }
+                Ok(json!({"nodes": nodes}))
+            }
+            "doc.moveNode" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let ix = v.get("index").and_then(Value::as_u64).context("index")? as usize;
+                let x = v.get("x").and_then(Value::as_f64).context("x")? as f32;
+                let y = v.get("y").and_then(Value::as_f64).context("y")? as f32;
+                let l = c.doc.layer_mut(id).context("layer not found")?;
+                let shapes = match &mut l.kind {
+                    LayerKind::Shape { shapes } => shapes,
+                    _ => anyhow::bail!("layer {id} is not a shape layer"),
+                };
+                // flat index → (shape, anchor): node order is per-shape, in path order
+                let mut rem = ix;
+                let mut done = None;
+                for (si, s) in shapes.iter_mut().enumerate() {
+                    let cnt = crate::shape::path_nodes(&s.d).map(|n| n.len()).unwrap_or(0);
+                    if rem < cnt {
+                        s.d =
+                            crate::shape::move_node(&s.d, rem, x, y).context("move_node failed")?;
+                        done = Some(si);
+                        break;
+                    }
+                    rem -= cnt;
+                }
+                let si = done.with_context(|| format!("node index {ix} out of range"))?;
+                l.gen += 1;
+                Ok(json!({"shape": si}))
             }
             _ => anyhow::bail!("unknown command id: {id}"),
         }
@@ -1586,6 +1632,39 @@ mod tests {
             p["result"]["pages"][0]["frames"].as_array().unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn shape_nodes_and_move() {
+        let mut s = s();
+        s.dispatch(&d(
+            &json!({"id": "doc.new", "name": "t", "w": 100, "h": 100}),
+        ));
+        let r = s.dispatch(&d(&json!({"id": "doc.addLayer", "kind": "shape",
+            "shapes": [{"d": "M10 10 L50 10 L50 40 L10 40 Z",
+                        "fill": [1.0, 0.0, 0.0, 1.0]}]})));
+        assert_eq!(r["ok"], true, "addLayer: {r}");
+        let lid = r["result"]["layerId"].as_u64().unwrap();
+
+        let r = s.dispatch(&d(&json!({"id": "doc.shapeNodes", "layer": lid})));
+        assert_eq!(r["ok"], true, "shapeNodes: {r}");
+        let nodes = r["result"]["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(nodes[1]["x"], json!(50.0));
+
+        let r = s.dispatch(&d(&json!({"id": "doc.moveNode", "layer": lid, "index": 1,
+                    "x": 60.0, "y": 15.0})));
+        assert_eq!(r["ok"], true, "moveNode: {r}");
+        let r = s.dispatch(&d(&json!({"id": "doc.shapeNodes", "layer": lid})));
+        assert_eq!(r["result"]["nodes"][1]["x"], json!(60.0));
+        assert_eq!(r["result"]["nodes"][1]["y"], json!(15.0));
+
+        // hostile: bad index / non-shape layer error without panic
+        let r = s.dispatch(&d(&json!({"id": "doc.moveNode", "layer": lid, "index": 99,
+                    "x": 0.0, "y": 0.0})));
+        assert_eq!(r["ok"], false);
+        let r = s.dispatch(&d(&json!({"id": "doc.shapeNodes", "layer": 9999})));
+        assert_eq!(r["ok"], false);
     }
 
     #[test]
