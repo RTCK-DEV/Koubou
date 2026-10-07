@@ -1010,7 +1010,8 @@ struct DocEditorView: View {
                    let l = DocStore.find(id, in: doc.layers), l.kind == "text" {
                     let now = Date()
                     if let last = lastTap, last.id == id,
-                       now.timeIntervalSince(last.time) < 0.45 {
+                       now.timeIntervalSince(last.time)
+                        < NSEvent.doubleClickInterval {
                         doc.textEdit = (id, (l.text?["text"] as? String) ?? "")
                         opened = id
                         lastTap = nil
@@ -1024,8 +1025,19 @@ struct DocEditorView: View {
                     commitTextEdit()
                 }
                 switch dragMode {
-                case .moving(let id, _, _), .scaling(let id, _, _, _):
-                    doc.commitTransform(id)
+                case .moving(let id, _, let orig):
+                    // a bare click is also .moving — commit only when the
+                    // transform actually changed, else every selection
+                    // click pushes a no-op mutation onto the undo stack
+                    if let l = DocStore.find(id, in: doc.layers),
+                       l.x != orig.x || l.y != orig.y {
+                        doc.commitTransform(id)
+                    }
+                case .scaling(let id, _, _, let s0):
+                    if let l = DocStore.find(id, in: doc.layers),
+                       l.scale != s0 {
+                        doc.commitTransform(id)
+                    }
                 default:
                     break
                 }
