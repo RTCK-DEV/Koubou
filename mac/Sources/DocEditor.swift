@@ -538,6 +538,7 @@ struct DocEditorView: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let l = doc.selLayer {
                     LayerInspector(doc: doc, layer: l)
+                        .id(l.id)   // fresh @State per layer — no stale recipe/name
                 } else {
                     Text("Select a layer")
                         .font(.system(size: 11)).foregroundStyle(Kou.text3)

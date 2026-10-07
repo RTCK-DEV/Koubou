@@ -397,7 +397,7 @@ fn grad_at(stops: &[[f32; 5]], t: f32) -> [f32; 4] {
 /// reshape the composite.
 fn sanitize_adjustment(r: &Recipe) -> Recipe {
     let mut r = r.clone();
-    r.crop = [0.0, 0.0, 1.0, 1.0];
+    r.crop = [0.0; 4];
     r.rotation_deg = 0.0;
     r.key_v = 0.0;
     r.key_h = 0.0;

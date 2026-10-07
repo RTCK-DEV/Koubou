@@ -109,12 +109,15 @@ fn adjustment_layer_darkens_below() {
     d.add_layer(Layer::adjustment("ev-1", r));
     let mut c = Composer::new(d).unwrap();
     let img = c.render().unwrap();
-    // should be ~0.4 of original after -1EV
-    assert!(
-        img.data[0] < 200 && img.data[0] > 60,
-        "adjusted px: {:?}",
-        &img.data[0..4]
-    );
+    // should be ~0.4 of original after -1EV — check every pixel: a sanitize
+    // bug once collapsed the adjusted output to 1×1, leaving all but the
+    // first pixel untouched and still passing a single-pixel assertion.
+    for (i, px) in img.data.chunks_exact(4).enumerate() {
+        assert!(
+            px[0] < 200 && px[0] > 60,
+            "px {i} not adjusted: {px:?} (expected ~102)"
+        );
+    }
 }
 
 #[test]

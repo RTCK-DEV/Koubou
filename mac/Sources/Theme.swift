@@ -181,7 +181,16 @@ struct NumValue: View {
                     .onSubmit(commit)
                     .onExitCommand { editing = false }
                     .onChange(of: focus) { _, f in if !f { commit() } }
-                    .onAppear { text = ""; focus = true }
+                    .onAppear {
+                        text = ""
+                        // a plain TextField elsewhere may still hold first
+                        // responder — resign it first, then claim focus after
+                        // the runloop turn so the steal actually lands
+                        DispatchQueue.main.async {
+                            NSApp.keyWindow?.makeFirstResponder(nil)
+                            focus = true
+                        }
+                    }
             } else {
                 Text(String(format: "%.\(digits)f", value))
                     .font(.system(size: 10.5).monospacedDigit())
