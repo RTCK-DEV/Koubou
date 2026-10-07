@@ -285,7 +285,7 @@ fn mcp_tools() -> Value {
         tool("thumb", "Write a thumbnail PNG", json!({"path": s("file"), "out": s("output path"), "maxPx": n("max dimension")}), &["path", "out"]),
         tool("render", "Develop an image file with a recipe JSON, write PNG", json!({"path": s("file"), "recipe": {"type": "object", "description": "recipe params"}, "out": s("output"), "maxPx": n("max dimension, 0=full")}), &["path", "out"]),
         tool("auto", "Auto-analyze exposure/WB for a file", json!({"path": s("file")}), &["path"]),
-        tool("sidecar.read", "Read the .koubou.json sidecar of an asset", json!({"path": s("file")}), &["path"]),
+        tool("sidecar.read", "Read the .araware.json sidecar of an asset", json!({"path": s("file")}), &["path"]),
         tool("setRating", "Set 0-5 rating on an asset", json!({"path": s("file"), "rating": n("0-5")}), &["path", "rating"]),
         tool("setLabel", "Set a colour label on an asset", json!({"path": s("file"), "label": s("label")}), &["path"]),
         tool("doc.new", "Create a new empty document", json!({"name": s("name"), "w": n("px"), "h": n("px")}), &[]),

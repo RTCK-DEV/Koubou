@@ -83,7 +83,7 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | JSON command dispatch (all ops by id) | ✅ | `composer::commands::Session` |
 | TCP control channel + stdio | ✅ | `koubou-cli control [--port N]` |
 | MCP server (tools/list, tools/call) | ✅ | `koubou-cli mcp` |
-| macOS FFI (engine + doc dispatch) | ✅ | `koubou_*`, `kou_*` exports |
+| macOS FFI (engine + doc dispatch) | ✅ | `araware_*` (engine), `kou_*` (docs) exports |
 | Undo-safe command log (for scripted sessions) | 🟡 | commands are idempotent-ish; no formal journal |
 | Headless UI snapshot (app-level) | ❌ | render verification via `doc.render` instead |
 

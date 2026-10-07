@@ -169,7 +169,19 @@ impl Composer {
             rgba: snapshot.to_rgba16(),
             w: snapshot.w as usize,
             h: snapshot.h as usize,
-            info: Default::default(),
+            // no camera info for an in-memory raster (literal so we don't
+            // depend on CameraInfo: Default in the engine crate)
+            info: koubou_core::decode::CameraInfo {
+                make: String::new(),
+                model: String::new(),
+                lens: String::new(),
+                iso: 0.0,
+                shutter: 0.0,
+                aperture: 0.0,
+                focal: 0.0,
+                timestamp: 0,
+                flip: 0,
+            },
             flip: 0,
         };
         let out = develop::develop_cpu(&d, &r, 0);
@@ -229,6 +241,7 @@ impl Composer {
         let scale = layer.scale.max(1e-4);
         let dw = (pix.w as f32 * scale).ceil() as i64;
         let dh = (pix.h as f32 * scale).ceil() as i64;
+
         let x0 = layer.x as i64;
         let y0 = layer.y as i64;
         let cw = canvas.w as i64;

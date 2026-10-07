@@ -1,8 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "composer"]
+members = ["cli", "composer"]
 
 [workspace.dependencies]
+# engine lives in araware — Koubou tracks its work branch; `cargo update -p
+# araware-core` pulls new engine work (recipe/decode changes included)
+koubou-core = { package = "araware-core", git = "https://github.com/RTCK-reina/araware", branch = "devin/initial-implementation" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

@@ -139,8 +139,16 @@ impl Session {
                 let p = req_str(v, "path")?;
                 let path = PathBuf::from(&p);
                 let meta = self.engine.metadata(&path)?;
-                let w = meta["width"].as_u64().context("meta width")? as u32;
-                let h = meta["height"].as_u64().context("meta height")? as u32;
+                // raster dims may be absent on older araware-core — fall back
+                // to reading the file header directly.
+                let dims = || -> Result<(u64, u64)> {
+                    image::image_dimensions(&path).map_err(anyhow::Error::from)
+                        .map(|(w, h)| (w as u64, h as u64))
+                };
+                let w = meta["width"].as_u64()
+                    .or_else(|| dims().ok().map(|d| d.0)).context("meta width")? as u32;
+                let h = meta["height"].as_u64()
+                    .or_else(|| dims().ok().map(|d| d.1)).context("meta height")? as u32;
                 self.composer = Some(Composer::new(Document::from_photo(&path, w, h))?);
                 Ok(json!({"w": w, "h": h}))
             }
@@ -231,6 +239,7 @@ fn req_u64(v: &Value, k: &str) -> Result<u64> {
 fn recipe_arg(v: &Value) -> Result<Recipe> {
     match v.get("recipe") {
         None => Ok(Recipe::default()),
+        Some(Value::Null) => Ok(Recipe::default()),
         Some(r) if r.is_string() => Recipe::from_json(r.as_str().unwrap())
             .context("invalid recipe JSON"),
         Some(r) => serde_json::from_value(r.clone()).map_err(Into::into),

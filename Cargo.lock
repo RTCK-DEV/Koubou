@@ -107,6 +107,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "araware-core"
+version = "0.1.0"
+source = "git+https://github.com/RTCK-reina/araware?branch=devin%2Finitial-implementation#b1695df9c8e1cfb4b0961f5e118032e6e4135e49"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "cc",
+ "image",
+ "kamadak-exif",
+ "log",
+ "pollster",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "walkdir",
+ "wgpu",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1025,10 +1045,10 @@ name = "koubou-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "araware-core",
  "env_logger",
  "image",
  "koubou-composer",
- "koubou-core",
  "log",
  "serde",
  "serde_json",
@@ -1039,12 +1059,12 @@ name = "koubou-composer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "araware-core",
  "base64",
  "bytemuck",
  "fontdb",
  "fontdue",
  "image",
- "koubou-core",
  "log",
  "psd",
  "rayon",
@@ -1052,25 +1072,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tiny-skia",
-]
-
-[[package]]
-name = "koubou-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "cc",
- "image",
- "kamadak-exif",
- "log",
- "pollster",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "walkdir",
- "wgpu",
 ]
 
 [[package]]

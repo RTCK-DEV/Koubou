@@ -1,9 +1,14 @@
 # Koubou — instructions for agents
 
-All-in-one macOS photo app: Lightroom-style library + RAW develop
-(`koubou-core`, from araware) plus a Photoshop-style layered document
-engine (`koubou-composer`). MIT. LibRaw is dynamically linked; no GPL code
-in the tree.
+All-in-one macOS photo app: Lightroom-style library + RAW develop plus a
+Photoshop-style layered document engine (`koubou-composer`). MIT. LibRaw
+is dynamically linked; no GPL code in the tree.
+
+The RAW engine is **`araware-core`, consumed as a git dependency** tracking
+araware's `devin/initial-implementation` branch — never vendor or fork
+engine code here. Engine bugs/features are fixed in araware and pulled in
+via `cargo update -p araware-core`; only Koubou-specific glue (documents,
+compositing, FFI, UI) lives in this tree.
 
 ## Start every session here
 
@@ -72,8 +77,10 @@ consistent with this.
 
 ## Map of the code
 
-- `core/`: `decode` (LibRaw+raster) → `demosaic` → `develop` (recipe ops)
-  → `engine` (scan/render/thumb/meta/sidecars/auto) → `capi` (`koubou_*` FFI)
+- engine (external): `araware-core` git dep — `decode` (LibRaw+raster) →
+  `develop` (recipe ops) → `engine` (scan/render/thumb/meta/sidecars/auto)
+  → `araware_*` C FFI. Sidecars are `<stem>.araware.json` (shared with
+  araware); env: `ARA_DISABLE_GPU`, `ARAWARE_HOME`.
 - `composer/`: `doc` (model+serde), `composite` (layer stack renderer),
   `blend` (27 modes), `shape` (SVG path → tiny-skia), `text` (fontdue +
   fontdb), `psd` (import), `commands` (dispatch), `capi` (`kou_*` FFI)

@@ -42,7 +42,7 @@ enum WbMode: String, Codable, CaseIterable {
     case pick = "pick"
 }
 
-/// Mirrors koubou_core::recipe::PowerWindow (serde).
+/// Mirrors araware_core::recipe::PowerWindow (serde).
 struct PowerWindow: Codable, Equatable, Identifiable {
     var id = UUID()
     var kind: String = "circle"      // "circle" [cx,cy,rx,ry,rot_deg,soft] | "gradient" [x1,y1,x2,y2,soft,0]
@@ -71,7 +71,7 @@ struct PowerWindow: Codable, Equatable, Identifiable {
     }
 }
 
-/// Mirrors koubou_core::recipe::Recipe (serde snake_case).
+/// Mirrors araware_core::recipe::Recipe (serde snake_case).
 struct Recipe: Codable, Equatable {
     var exposure: Double = 0
     var contrast: Double = 0
@@ -272,7 +272,7 @@ extension Recipe {
     }
 }
 
-/// Mirrors koubou_core::recipe::GradeVersion: named recipe snapshot
+/// Mirrors araware_core::recipe::GradeVersion: named recipe snapshot
 /// (DaVinci grade version / gallery still).
 struct GradeVersion: Codable, Equatable, Identifiable {
     var id = UUID()
@@ -293,7 +293,7 @@ struct GradeVersion: Codable, Equatable, Identifiable {
     }
 }
 
-/// Mirrors koubou_core::recipe::Sidecar.
+/// Mirrors araware_core::recipe::Sidecar.
 struct Sidecar: Codable {
     var version: Int = 1
     var rating: Int = 0
@@ -302,7 +302,7 @@ struct Sidecar: Codable {
     var versions: [GradeVersion] = []
 }
 
-/// Suggested corrections from `koubou_auto_analyze` (core/src/auto.rs).
+/// Suggested corrections from `araware_auto_analyze` (core/src/auto.rs).
 struct AutoSuggestion: Codable {
     var rotation_deg: Double = 0
     var key_v: Double = 0

@@ -5,7 +5,7 @@ edition = "2021"
 description = "koubou layered document engine: layers, masks, blend modes, vector shapes, text, compositor"
 
 [dependencies]
-koubou-core = { path = "../core" }
+koubou-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
