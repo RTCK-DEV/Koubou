@@ -15,7 +15,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 
 use crate::model::{Frame, FrameKind, PagesDoc};
-use crate::text::{layout_text, to_winansi};
+use crate::text::{to_winansi, winansi_covers};
 
 /// render every page of the document to PDF bytes
 pub fn render_pdf(doc: &PagesDoc) -> Result<Vec<u8>> {
@@ -34,9 +34,12 @@ pub fn render_pdf(doc: &PagesDoc) -> Result<Vec<u8>> {
             .to_vec(),
     );
 
+    // threaded-text resolution is document-global (chains may cross pages)
+    let flows = crate::flow::resolve_flow(doc)?;
+
     let mut kids = Vec::with_capacity(doc.pages.len());
     for i in 0..doc.pages.len() {
-        kids.push(page(&mut w, doc, i, pages_id, font_id)?);
+        kids.push(page(&mut w, doc, i, pages_id, font_id, &flows)?);
     }
 
     let kids_str: Vec<String> = kids.iter().map(|k| format!("{k} 0 R")).collect();
@@ -57,7 +60,14 @@ pub fn render_pdf(doc: &PagesDoc) -> Result<Vec<u8>> {
 }
 
 /// emit one page's objects; returns the /Page object id
-fn page(w: &mut Writer, doc: &PagesDoc, idx: usize, pages_id: u32, font_id: u32) -> Result<u32> {
+fn page(
+    w: &mut Writer,
+    doc: &PagesDoc,
+    idx: usize,
+    pages_id: u32,
+    font_id: u32,
+    flows: &std::collections::HashMap<u64, crate::flow::FrameFlow>,
+) -> Result<u32> {
     let page_id = w.reserve();
     let frames = doc.resolved_frames(idx)?;
 
@@ -75,6 +85,7 @@ fn page(w: &mut Writer, doc: &PagesDoc, idx: usize, pages_id: u32, font_id: u32)
             &mut xobjects,
             &mut extgstates,
             &mut xo_seq,
+            flows,
         )?;
     }
 
@@ -148,6 +159,7 @@ fn frame_ops(
     xobjects: &mut Vec<(String, u32)>,
     extgstates: &mut HashMap<u32, String>,
     xo_seq: &mut usize,
+    flows: &std::collections::HashMap<u64, crate::flow::FrameFlow>,
 ) -> Result<()> {
     out.push_str("q\n");
 
@@ -239,37 +251,80 @@ fn frame_ops(
             ));
         }
         FrameKind::Text {
-            text,
-            font,
-            size,
-            color,
-            align,
-            leading,
+            font, size, color, ..
         } => {
-            if !text.is_empty() {
-                let lay = layout_text(font, text, *size, *leading, *align, f.w)?;
-                alpha_state(out, extgstates, color[3]);
-                out.push_str(&format!("{} rg\nBT /F1 {} Tf\n", rgb(*color), num(*size)));
-                for line in &lay.lines {
-                    if line.text.is_empty() {
-                        continue;
+            // the flow map covers every text frame — a missing entry (only
+            // possible via a corrupt chain) renders nothing
+            if let Some(fl) = flows.get(&f.id) {
+                // Fast path: base-14 Helvetica + WinAnsi text ops.
+                // Everything else — CJK and other non-WinAnsi runs,
+                // non-Helvetica faces, font files — rasterizes through the
+                // text engine into an image XObject with an alpha SMask,
+                // so the PDF shows the real glyphs instead of '?'.
+                let type1_ok =
+                    uses_base14(font) && fl.layout.lines.iter().all(|l| winansi_covers(&l.text));
+                if type1_ok {
+                    alpha_state(out, extgstates, color[3]);
+                    out.push_str(&format!("{} rg\nBT /F1 {} Tf\n", rgb(*color), num(*size)));
+                    for line in &fl.layout.lines {
+                        if line.text.is_empty() {
+                            continue;
+                        }
+                        let tx = f.x + line.x_off;
+                        let ty = doc.page_h - (f.y + line.baseline);
+                        out.push_str(&format!(
+                            "1 0 0 1 {} {} Tm ({}) Tj\n",
+                            num(tx),
+                            num(ty),
+                            pdf_escape(&to_winansi(&line.text))
+                        ));
                     }
-                    let tx = f.x + line.x_off;
-                    let ty = doc.page_h - (f.y + line.baseline);
-                    out.push_str(&format!(
-                        "1 0 0 1 {} {} Tm ({}) Tj\n",
-                        num(tx),
-                        num(ty),
-                        pdf_escape(&to_winansi(&line.text))
-                    ));
+                    out.push_str("ET\n");
+                } else {
+                    let img =
+                        crate::raster::text_stamp(&fl.layout, *color, f.w, f.h, TEXT_RASTER_SCALE);
+                    // skip fully transparent output rather than embedding a
+                    // blank image (e.g. only whitespace laid out)
+                    if img.pixels().any(|p| p[3] != 0) {
+                        let name = format!("Im{}", *xo_seq);
+                        *xo_seq += 1;
+                        let id = push_rgba_image(w, &img)?;
+                        xobjects.push((name.clone(), id));
+                        // the stamp covers the whole frame box — text sits
+                        // at its laid positions inside it
+                        let py = doc.page_h - (f.y + f.h);
+                        out.push_str(&format!(
+                            "{} 0 0 {} {} {} cm /{name} Do\n",
+                            num(f.w),
+                            num(f.h),
+                            num(f.x),
+                            num(py)
+                        ));
+                    }
                 }
-                out.push_str("ET\n");
             }
         }
     }
 
     out.push_str("Q\n");
     Ok(())
+}
+
+/// px-per-pt for rasterized text — 4× (288 dpi effective): sharp enough for
+/// print adjacency while keeping embedded image sizes modest.
+const TEXT_RASTER_SCALE: f32 = 4.0;
+
+/// does the font spec map onto the shared Helvetica Type1 resource? An
+/// empty spec resolves to Helvetica anyway; explicit non-Helvetica specs
+/// rasterize so the requested face (not Helvetica) reaches the PDF.
+fn uses_base14(spec: &str) -> bool {
+    if spec.is_empty() {
+        return true;
+    }
+    matches!(
+        spec.to_ascii_lowercase().as_str(),
+        "helvetica" | "arial" | "helvetica neue"
+    )
 }
 
 /// register an alpha value and emit `/GSn gs`
@@ -420,8 +475,15 @@ fn embed_image(w: &mut Writer, path: &Path) -> Result<u32> {
     let img = image::open(path)
         .with_context(|| format!("decode image {}", path.display()))?
         .to_rgba8();
+    push_rgba_image(w, &img)
+}
+
+/// embed raw RGBA8 pixels as an image XObject; an /SMask (DeviceGray,
+/// FlateDecode) is added whenever any alpha byte is < 255. Returns the
+/// object id. Shared by file images and rasterized text.
+fn push_rgba_image(w: &mut Writer, img: &image::RgbaImage) -> Result<u32> {
     let (wid, hei) = img.dimensions();
-    let raw = img.into_raw();
+    let raw = img.as_raw();
     let (pixels, _) = raw.as_chunks::<4>();
     let has_alpha = pixels.iter().any(|p| p[3] != 255);
 
@@ -546,22 +608,60 @@ mod tests {
         assert!(jpeg_dims(b"notajpeg").is_err());
     }
 
-    /// decompress the first FlateDecode content stream in the pdf bytes
+    /// decompress the first *content* stream (a page's op stream — not an
+    /// image stream, which has /Subtype /Image in its dict)
     fn first_content_stream(pdf: &[u8]) -> String {
-        let start = pdf
+        let mut pos = 0usize;
+        while let Some(p) = pdf[pos..].windows(7).position(|w| w == b"stream\n") {
+            let start = pos + p + 7;
+            let hdr_end = pdf[..start]
+                .windows(2)
+                .rposition(|w| w == b"<<")
+                .unwrap_or(0);
+            let header = String::from_utf8_lossy(&pdf[hdr_end..start]);
+            if header.contains("/Subtype /Image") {
+                pos = start;
+                continue;
+            }
+            let end = pdf[start..]
+                .windows(9)
+                .position(|w| w == b"endstream")
+                .map(|p| start + p)
+                .unwrap();
+            let mut dec = flate2::read::ZlibDecoder::new(&pdf[start..end]);
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut dec, &mut s).unwrap();
+            return s;
+        }
+        panic!("no content stream found");
+    }
+
+    /// inflate the stream of the first object containing `marker`, honoring
+    /// its /Length (compressed bytes may contain "endstream" by chance)
+    fn inflate_stream_after(pdf: &[u8], marker: &[u8]) -> Vec<u8> {
+        let mpos = pdf
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .unwrap_or_else(|| panic!("marker {:?} not found", String::from_utf8_lossy(marker)));
+        let after = &pdf[mpos..];
+        let sstart = after
             .windows(7)
             .position(|w| w == b"stream\n")
             .map(|p| p + 7)
             .unwrap();
-        let end = pdf[start..]
-            .windows(9)
-            .position(|w| w == b"endstream")
-            .map(|p| start + p)
-            .unwrap();
-        let mut dec = flate2::read::ZlibDecoder::new(&pdf[start..end]);
-        let mut s = String::new();
-        std::io::Read::read_to_string(&mut dec, &mut s).unwrap();
-        s
+        // /Length sits in the dict just above the stream
+        let hdr = String::from_utf8_lossy(&after[..sstart.min(after.len())]);
+        let lpos = hdr.rfind("/Length ").expect("no /Length");
+        let digits: String = hdr[lpos + 8..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let len: usize = digits.parse().expect("bad /Length");
+        let data = &after[sstart..sstart + len];
+        let mut dec = flate2::read::ZlibDecoder::new(data);
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut dec, &mut out).unwrap();
+        out
     }
 
     #[test]
@@ -603,6 +703,7 @@ mod tests {
             color: [0.0, 0.0, 0.0, 1.0],
             align: TextAlign::Left,
             leading: 1.2,
+            style: String::new(),
         });
         let pdf = render_pdf(&d).unwrap();
         let s = String::from_utf8_lossy(&pdf);
@@ -653,6 +754,56 @@ mod tests {
                 .any(|w| w == jpeg_bytes.as_slice()),
             "jpeg payload not embedded verbatim"
         );
+    }
+
+    #[test]
+    fn cjk_text_embeds_smask_image_not_question_marks() {
+        // "建築確認申請" is not WinAnsi-representable: the run must rasterize
+        // into an image XObject + alpha SMask instead of '(???) Tj'
+        let d = doc_with_frame(FrameKind::Text {
+            text: "建築確認申請".into(),
+            font: String::new(),
+            size: 24.0,
+            color: [0.0, 0.0, 0.0, 1.0],
+            align: TextAlign::Left,
+            leading: 1.2,
+            style: String::new(),
+        });
+        let pdf = render_pdf(&d).unwrap();
+        let s = String::from_utf8_lossy(&pdf);
+        assert!(s.contains("/SMask"), "rasterized text needs an alpha SMask");
+        assert!(
+            s.contains("/Subtype /Image"),
+            "rasterized text needs an image XObject"
+        );
+        // content stream draws an image, never a WinAnsi text op
+        let c = first_content_stream(&pdf);
+        assert!(c.contains(" Do"), "expected an image draw op:\n{c}");
+        assert!(
+            !c.contains("Tj"),
+            "CJK must not take the WinAnsi path:\n{c}"
+        );
+        // the gray alpha stream must carry real coverage
+        let smask = inflate_stream_after(&pdf, b"/DeviceGray");
+        assert!(
+            smask.iter().filter(|&&b| b != 0).count() > 100,
+            "smask coverage too small — glyphs missing"
+        );
+        // non-Helvetica specs also rasterize (even for latin) so the
+        // requested face reaches the PDF, not Helvetica
+        let d2 = doc_with_frame(FrameKind::Text {
+            text: "styled latin".into(),
+            font: "Futura".into(),
+            size: 12.0,
+            color: [0.0, 0.0, 0.0, 1.0],
+            align: TextAlign::Left,
+            leading: 1.2,
+            style: String::new(),
+        });
+        let pdf2 = render_pdf(&d2).unwrap();
+        let c2 = first_content_stream(&pdf2);
+        assert!(c2.contains(" Do"), "non-Helvetica should rasterize:\n{c2}");
+        assert!(!c2.contains("(styled latin) Tj"));
     }
 
     #[test]

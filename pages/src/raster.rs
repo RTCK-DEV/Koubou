@@ -4,13 +4,15 @@
 //! the stamp is blit into the page with bilinear sampling under the frame's
 //! rotation — one code path covers every kind. Page background is paper-white.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use image::{Rgba, RgbaImage};
 
-use crate::model::{Frame, FrameKind, PagesDoc, Stroke, TextAlign};
-use crate::text::layout_text;
+use crate::flow::FrameFlow;
+use crate::model::{Frame, FrameKind, PagesDoc, Stroke};
+use crate::text::Layout;
 
 /// render `page_idx` at `dpi` (pt → px = dpi/72); returns an RGBA image
 pub fn render_page(doc: &PagesDoc, page_idx: usize, dpi: f32) -> Result<RgbaImage> {
@@ -22,13 +24,19 @@ pub fn render_page(doc: &PagesDoc, page_idx: usize, dpi: f32) -> Result<RgbaImag
     let h = (doc.page_h * s).round().max(1.0) as u32;
     let mut img = RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]));
 
+    let flows = crate::flow::resolve_flow(doc)?;
     for f in &doc.resolved_frames(page_idx)? {
-        draw_frame(&mut img, f, s)?;
+        draw_frame(&mut img, f, s, &flows)?;
     }
     Ok(img)
 }
 
-fn draw_frame(img: &mut RgbaImage, f: &Frame, s: f32) -> Result<()> {
+fn draw_frame(
+    img: &mut RgbaImage,
+    f: &Frame,
+    s: f32,
+    flows: &HashMap<u64, FrameFlow>,
+) -> Result<()> {
     let sw = (f.w * s).round().max(1.0) as u32;
     let sh = (f.h * s).round().max(1.0) as u32;
     let mut stamp = RgbaImage::from_pixel(sw, sh, Rgba([0, 0, 0, 0]));
@@ -48,24 +56,12 @@ fn draw_frame(img: &mut RgbaImage, f: &Frame, s: f32) -> Result<()> {
         FrameKind::Image { path, fit } => {
             paint_image(&mut stamp, path, fit, f.w, f.h, s)?;
         }
-        FrameKind::Text {
-            text,
-            font,
-            size,
-            color,
-            align,
-            leading,
-        } => {
-            let t = TextSpec {
-                text,
-                font,
-                size: *size,
-                color: *color,
-                align: *align,
-                leading: *leading,
-                frame_w: f.w,
-            };
-            paint_text(&mut stamp, &t, s)?;
+        FrameKind::Text { color, .. } => {
+            // resolved through the flow map: linked frames show their
+            // chain's continuation, and overset lines are already dropped
+            if let Some(fl) = flows.get(&f.id) {
+                paint_layout(&mut stamp, &fl.layout, *color, s);
+            }
         }
     }
 
@@ -191,29 +187,26 @@ fn paint_image(
     Ok(())
 }
 
-/// text-frame fields bundled for `paint_text`
-struct TextSpec<'a> {
-    text: &'a str,
-    font: &'a str,
-    size: f32,
-    color: [f32; 4],
-    align: TextAlign,
-    leading: f32,
-    frame_w: f32,
+/// transparent RGBA stamp of `w`×`h` pt at `s` px/pt with `lay`'s glyphs
+/// painted in `color` — used by the PDF writer for CJK/non-Helvetica runs
+pub fn text_stamp(lay: &Layout, color: [f32; 4], w_pt: f32, h_pt: f32, s: f32) -> RgbaImage {
+    let sw = (w_pt * s).round().max(1.0) as u32;
+    let sh = (h_pt * s).round().max(1.0) as u32;
+    let mut stamp = RgbaImage::from_pixel(sw, sh, Rgba([0, 0, 0, 0]));
+    paint_layout(&mut stamp, lay, color, s);
+    stamp
 }
 
-fn paint_text(stamp: &mut RgbaImage, t: &TextSpec, s: f32) -> Result<()> {
-    if t.text.is_empty() {
-        return Ok(());
-    }
-    // layout in pt; glyphs rasterize at px = size * scale
-    let lay = layout_text(t.font, t.text, t.size, t.leading, t.align, t.frame_w)?;
-    let px_size = (t.size * s).max(1.0);
+/// paint a laid-out text flow into the stamp at `s` px/pt. Per-char font
+/// fallback (CJK) happens via `lay.fonts.font_for`.
+fn paint_layout(stamp: &mut RgbaImage, lay: &Layout, color: [f32; 4], s: f32) {
+    let px_size = (lay.px * s).max(1.0);
     for line in &lay.lines {
         let mut pen = line.x_off * s;
         let baseline = line.baseline * s;
         for ch in line.text.chars() {
-            let (m, bmp) = lay.font.rasterize(ch, px_size);
+            let font = lay.fonts.font_for(ch);
+            let (m, bmp) = font.rasterize(ch, px_size);
             let gx = (pen + m.xmin as f32).round() as i64;
             let gy = (baseline - m.ymin as f32 - m.height as f32).round() as i64;
             for row in 0..m.height {
@@ -227,7 +220,7 @@ fn paint_text(stamp: &mut RgbaImage, t: &TextSpec, s: f32) -> Result<()> {
                     if x < 0 || y < 0 || x >= stamp.width() as i64 || y >= stamp.height() as i64 {
                         continue;
                     }
-                    let mut c = t.color;
+                    let mut c = color;
                     c[3] *= a as f32 / 255.0;
                     blend_px(stamp, x as u32, y as u32, c);
                 }
@@ -235,7 +228,6 @@ fn paint_text(stamp: &mut RgbaImage, t: &TextSpec, s: f32) -> Result<()> {
             pen += m.advance_width;
         }
     }
-    Ok(())
 }
 
 /// rotate `stamp` about the frame center and source-over into `img`

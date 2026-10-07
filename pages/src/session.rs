@@ -52,6 +52,11 @@ impl PgSession {
             "pg.removeFrame",
             "pg.moveFrame",
             "pg.setMaster",
+            "pg.setPageSize",
+            "pg.linkFrames",
+            "pg.setSpread",
+            "pg.setStyle",
+            "pg.applyStyle",
             "pg.render",
             "pg.renderPng",
         ]
@@ -70,6 +75,7 @@ impl PgSession {
                 if let Some(m) = v.get("margins") {
                     d.margins = serde_json::from_value(m.clone()).context("margins")?;
                 }
+                d.facing = v.get("facing").and_then(Value::as_bool).unwrap_or(false);
                 self.doc = Some(d);
                 self.path = None;
                 Ok(json!({"name": name, "pageW": w, "pageH": h}))
@@ -96,7 +102,32 @@ impl PgSession {
             }
             "pg.json" => {
                 let d = self.doc.as_ref().context("no document")?;
-                serde_json::to_value(d).map_err(Into::into)
+                let mut v = serde_json::to_value(d)?;
+                if let Some(obj) = v.as_object_mut() {
+                    // view hints: how pages pair into spreads, and what text
+                    // each frame actually shows after link resolution
+                    obj.insert(
+                        "spread".to_string(),
+                        json!({"facing": d.facing, "pairs": d.spread_pairs()}),
+                    );
+                    let flows = crate::flow::resolve_flow(d)?;
+                    let mut tf = serde_json::Map::new();
+                    for (id, fl) in &flows {
+                        let shown: String = fl
+                            .layout
+                            .lines
+                            .iter()
+                            .map(|l| l.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        tf.insert(
+                            id.to_string(),
+                            json!({"text": shown, "overset": fl.overset}),
+                        );
+                    }
+                    obj.insert("textFlow".to_string(), Value::Object(tf));
+                }
+                Ok(v)
             }
             "pg.addPage" => {
                 let d = self.doc.as_mut().context("no document")?;
@@ -157,6 +188,166 @@ impl PgSession {
                 let id = req_u64(v, "frame")?;
                 d.remove_frame(id)
                     .with_context(|| format!("frame {id} not found"))?;
+                Ok(json!("ok"))
+            }
+            "pg.setPageSize" => {
+                let d = self.doc.as_mut().context("no document")?;
+                let w = opt_f(v, "w")?.context("missing param 'w'")?;
+                let h = opt_f(v, "h")?.context("missing param 'h'")?;
+                if !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
+                    anyhow::bail!("bad page size {w}×{h}");
+                }
+                // frames keep their positions — same behaviour as changing
+                // page size in InDesign's Document Setup
+                d.page_w = w;
+                d.page_h = h;
+                Ok(json!({"pageW": w, "pageH": h}))
+            }
+            "pg.linkFrames" => {
+                let d = self.doc.as_mut().context("no document")?;
+                let id = req_u64(v, "frame")?;
+                if !is_text_frame(d, id) {
+                    anyhow::bail!("frame {id} is not a text frame");
+                }
+                let to = match v.get("to") {
+                    None => anyhow::bail!("missing param 'to' (frame id or null)"),
+                    Some(Value::Null) => None,
+                    Some(t) => Some(
+                        t.as_u64()
+                            .context("param 'to' must be a frame id or null")?,
+                    ),
+                };
+                if let Some(t) = to {
+                    if t == id {
+                        anyhow::bail!("cannot link a frame to itself");
+                    }
+                    if !is_text_frame(d, t) {
+                        anyhow::bail!("frame {t} is not a text frame");
+                    }
+                    // reject links that would close a cycle: walking `next`
+                    // from the target must never reach the source
+                    let mut cur = t;
+                    let mut seen = std::collections::HashSet::new();
+                    loop {
+                        if cur == id {
+                            anyhow::bail!("link would create a cycle");
+                        }
+                        if !seen.insert(cur) {
+                            break; // existing ring unrelated to `id` — let render's guard handle
+                        }
+                        match d.frame(cur).and_then(|f| f.next) {
+                            Some(n) => cur = n,
+                            None => break,
+                        }
+                    }
+                }
+                // unwrap is safe: existence checked above
+                let f = d.frame_mut(id).context("frame vanished")?;
+                f.next = to;
+                Ok(json!("ok"))
+            }
+            "pg.setSpread" => {
+                let d = self.doc.as_mut().context("no document")?;
+                let facing = v
+                    .get("facing")
+                    .and_then(Value::as_bool)
+                    .context("missing param 'facing'")?;
+                d.facing = facing;
+                Ok(json!({"facing": facing, "pairs": d.spread_pairs()}))
+            }
+            "pg.setStyle" => {
+                let d = self.doc.as_mut().context("no document")?;
+                let name = req_str(v, "name")?;
+                if name.is_empty() {
+                    anyhow::bail!("style name cannot be empty");
+                }
+                // merge semantics (like pg.setFrame): provided fields
+                // overwrite, explicit null clears, omitted fields keep
+                let st = d.styles.entry(name.clone()).or_default();
+                if let Some(f) = v.get("font") {
+                    st.font = match f {
+                        Value::Null => None,
+                        x => Some(
+                            x.as_str()
+                                .context("param 'font' must be a string")?
+                                .to_string(),
+                        ),
+                    };
+                }
+                if let Some(x) = v.get("size") {
+                    match x {
+                        Value::Null => st.size = None,
+                        x => {
+                            let s = x.as_f64().context("param 'size' must be a number")? as f32;
+                            if !(s > 0.0 && s.is_finite()) {
+                                anyhow::bail!("style size must be > 0");
+                            }
+                            st.size = Some(s);
+                        }
+                    }
+                }
+                if let Some(x) = v.get("color") {
+                    match x {
+                        Value::Null => st.color = None,
+                        x => {
+                            st.color = Some(
+                                serde_json::from_value::<[f32; 4]>(x.clone())
+                                    .context("param 'color' must be [r,g,b,a]")?,
+                            );
+                        }
+                    }
+                }
+                if let Some(x) = v.get("leading") {
+                    match x {
+                        Value::Null => st.leading = None,
+                        x => {
+                            let l = x.as_f64().context("param 'leading' must be a number")? as f32;
+                            if !(l > 0.0 && l.is_finite()) {
+                                anyhow::bail!("style leading must be > 0");
+                            }
+                            st.leading = Some(l);
+                        }
+                    }
+                }
+                Ok(json!({"style": name}))
+            }
+            "pg.applyStyle" => {
+                let d = self.doc.as_mut().context("no document")?;
+                let id = req_u64(v, "frame")?;
+                let name = req_str(v, "name")?;
+                let st = d
+                    .styles
+                    .get(&name)
+                    .with_context(|| format!("style '{name}' not defined (see pg.setStyle)"))?
+                    .clone();
+                let f = d
+                    .frame_mut(id)
+                    .with_context(|| format!("frame {id} not found"))?;
+                match &mut f.kind {
+                    FrameKind::Text {
+                        font,
+                        size,
+                        color,
+                        leading,
+                        style,
+                        ..
+                    } => {
+                        if let Some(x) = &st.font {
+                            *font = x.clone();
+                        }
+                        if let Some(x) = st.size {
+                            *size = x;
+                        }
+                        if let Some(x) = st.color {
+                            *color = x;
+                        }
+                        if let Some(x) = st.leading {
+                            *leading = x;
+                        }
+                        *style = name;
+                    }
+                    _ => anyhow::bail!("frame {id} is not a text frame"),
+                }
                 Ok(json!("ok"))
             }
             "pg.setMaster" => {
@@ -229,6 +420,10 @@ fn req_u64(v: &Value, k: &str) -> Result<u64> {
 
 fn req_usize(v: &Value, k: &str) -> Result<usize> {
     Ok(req_u64(v, k)? as usize)
+}
+
+fn is_text_frame(d: &PagesDoc, id: u64) -> bool {
+    matches!(d.frame(id), Some(f) if matches!(f.kind, FrameKind::Text { .. }))
 }
 
 /// optional numeric param — errors if present but not a number
@@ -332,6 +527,7 @@ fn frame_from(v: &Value) -> Result<Frame> {
                     .map(TextAlign::parse)
                     .unwrap_or_default(),
                 leading: opt_f(v, "leading")?.unwrap_or(1.2),
+                style: String::new(),
             },
             0.0,
             0.0,
@@ -401,6 +597,7 @@ fn set_frame(doc: &mut PagesDoc, id: u64, v: &Value) -> Result<Value> {
             color,
             align,
             leading,
+            ..
         } => {
             if let Some(t) = v.get("text").and_then(Value::as_str) {
                 *text = t.to_string();
@@ -546,6 +743,36 @@ pub fn command_specs() -> Vec<Value> {
             "Assign/remove a page's master (master: index or null)",
             json!({"page": n("page index"), "master": n("master index or null")}),
             &["page"],
+        ),
+        spec(
+            "pg.setPageSize",
+            "Resize the document's pages (w/h in pt; frames keep positions)",
+            json!({"w": n("page width pt"), "h": n("page height pt")}),
+            &["w", "h"],
+        ),
+        spec(
+            "pg.linkFrames",
+            "Thread text frames: overflow beyond a frame's height continues into 'to' (frame id or null to unlink)",
+            json!({"frame": n("source frame id"), "to": n("target text frame id, or null")}),
+            &["frame", "to"],
+        ),
+        spec(
+            "pg.setSpread",
+            "Facing pages on/off: pages >= 1 pair as verso/recto in pg.json's spread field (PDF stays one page per sheet)",
+            json!({"facing": json!({"type": "boolean", "description": "facing pages"})}),
+            &["facing"],
+        ),
+        spec(
+            "pg.setStyle",
+            "Define/update a named text style (fields omitted keep current values; null clears)",
+            json!({"name": s("style name"), "font": s("family name or path"), "size": n("pt"), "color": json!({"type": "array", "description": "[r,g,b,a] 0..1"}), "leading": n("multiplier")}),
+            &["name"],
+        ),
+        spec(
+            "pg.applyStyle",
+            "Apply a named style's set fields onto a text frame",
+            json!({"frame": n("text frame id"), "name": s("style name")}),
+            &["frame", "name"],
         ),
         spec(
             "pg.render",
