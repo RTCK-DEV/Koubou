@@ -208,8 +208,31 @@ fn handle_line(line: &str, session: &std::sync::Arc<std::sync::Mutex<Session>>) 
 
 // ---------- MCP (JSON-RPC over stdio) ----------
 
+/// One session-wide command registry drives everything: tools/list is
+/// generated from `Session::command_specs()` so the schema can never drift
+/// from the dispatcher, and tools/call maps the MCP-safe tool name back to
+/// the real command id (MCP clients reject tool names containing dots).
+struct ToolMap {
+    specs: Vec<Value>,
+    by_name: std::collections::HashMap<String, String>,
+}
+
+fn tool_map() -> ToolMap {
+    let specs = Session::command_specs();
+    let by_name = specs
+        .iter()
+        .filter_map(|s| {
+            let name = s.get("name")?.as_str()?.to_string();
+            let id = s.get("id")?.as_str()?.to_string();
+            Some((name, id))
+        })
+        .collect();
+    ToolMap { specs, by_name }
+}
+
 fn mcp() -> Result<()> {
     let session = std::sync::Mutex::new(Session::new().context("engine init")?);
+    let tools = tool_map();
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -229,27 +252,88 @@ fn mcp() -> Result<()> {
                 "jsonrpc": "2.0", "id": id,
                 "result": {
                     "protocolVersion": "2025-03-26",
-                    "capabilities": {"tools": {}},
+                    "capabilities": {"tools": {}, "resources": {}},
                     "serverInfo": {"name": "koubou", "version": env!("CARGO_PKG_VERSION")}
                 }
             }),
-            "notifications/initialized" | "initialized" => continue,
+            "notifications/initialized" | "initialized" | "notifications/cancelled" => continue,
             "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-            "tools/list" => json!({"jsonrpc": "2.0", "id": id, "result": {"tools": mcp_tools()}}),
+            "tools/list" => {
+                let list: Vec<Value> = tools
+                    .specs
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "name": s["name"],
+                            "description": s["description"],
+                            "inputSchema": s["inputSchema"],
+                        })
+                    })
+                    .collect();
+                json!({"jsonrpc": "2.0", "id": id, "result": {"tools": list}})
+            }
             "tools/call" => {
-                let name = req["params"]["name"].as_str().unwrap_or("");
-                let args = req["params"]["arguments"].clone();
-                let mut call = args;
-                call["id"] = Value::String(name.to_string());
+                let name = req["params"]["name"].as_str().unwrap_or("").to_string();
+                let Some(cmd) = tools.by_name.get(&name) else {
+                    let resp = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("unknown tool {name}")}});
+                    writeln!(out, "{resp}")?;
+                    out.flush()?;
+                    continue;
+                };
+                let mut call = req["params"]["arguments"].clone();
+                if !call.is_object() {
+                    call = json!({});
+                }
+                call["id"] = Value::String(cmd.clone());
                 let r = session
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .dispatch(&call);
                 let text = serde_json::to_string_pretty(&r).unwrap();
                 if r["ok"] == true {
-                    json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": text}]}})
+                    json!({"jsonrpc": "2.0", "id": id, "result": {
+                        "content": [{"type": "text", "text": text}],
+                        "structuredContent": r["result"].clone(),
+                    }})
                 } else {
                     json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": text}], "isError": true}})
+                }
+            }
+            // session state as MCP resources: current doc/timeline/pages JSON
+            "resources/list" => json!({"jsonrpc": "2.0", "id": id, "result": {"resources": [
+                {"uri": "koubou://doc", "name": "Open .koubou document", "mimeType": "application/json"},
+                {"uri": "koubou://timeline", "name": "Open .kmotion timeline", "mimeType": "application/json"},
+                {"uri": "koubou://pages", "name": "Open .kpages document", "mimeType": "application/json"},
+                {"uri": "koubou://commands", "name": "Command registry (ids + tool specs)", "mimeType": "application/json"},
+            ]}}),
+            "resources/read" => {
+                let uri = req["params"]["uri"].as_str().unwrap_or("");
+                let cmd = match uri {
+                    "koubou://doc" => Some(json!({"id": "doc.json"})),
+                    "koubou://timeline" => Some(json!({"id": "tl.json"})),
+                    "koubou://pages" => Some(json!({"id": "pg.json"})),
+                    "koubou://commands" => Some(json!({"id": "commands"})),
+                    _ => None,
+                };
+                match cmd {
+                    Some(call) => {
+                        let r = session
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .dispatch(&call);
+                        let text = if r["ok"] == true {
+                            serde_json::to_string_pretty(&r["result"])
+                                .unwrap_or_else(|_| "{}".into())
+                        } else {
+                            r["error"].as_str().unwrap_or("error").to_string()
+                        };
+                        json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "contents": [{"uri": uri, "mimeType": "application/json", "text": text}]
+                        }})
+                    }
+                    None => {
+                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("unknown resource {uri}")}})
+                    }
                 }
             }
             _ => {
@@ -265,6 +349,7 @@ fn mcp() -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn mcp_tools() -> Value {
     let tool = |name: &str, desc: &str, props: Value, required: &[&str]| {
         json!({

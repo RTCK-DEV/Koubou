@@ -46,9 +46,11 @@ impl PgSession {
             "pg.addPage",
             "pg.addMaster",
             "pg.removePage",
+            "pg.duplicatePage",
             "pg.addFrame",
             "pg.setFrame",
             "pg.removeFrame",
+            "pg.moveFrame",
             "pg.setMaster",
             "pg.render",
             "pg.renderPng",
@@ -125,6 +127,12 @@ impl PgSession {
                 d.remove_page(idx)?;
                 Ok(json!({"pages": d.pages.len()}))
             }
+            "pg.duplicatePage" => {
+                let d = self.doc.as_mut().context("no document")?;
+                let idx = req_usize(v, "page")?;
+                let new_idx = d.duplicate_page(idx)?;
+                Ok(json!({"page": new_idx}))
+            }
             "pg.addFrame" => {
                 let d = self.doc.as_mut().context("no document")?;
                 let target = frame_target(v)?;
@@ -136,6 +144,13 @@ impl PgSession {
                 let d = self.doc.as_mut().context("no document")?;
                 let id = req_u64(v, "frame")?;
                 set_frame(d, id, v)
+            }
+            "pg.moveFrame" => {
+                let d = self.doc.as_mut().context("no document")?;
+                let id = req_u64(v, "frame")?;
+                let target = frame_target(v)?;
+                d.move_frame(id, target)?;
+                Ok(json!("ok"))
             }
             "pg.removeFrame" => {
                 let d = self.doc.as_mut().context("no document")?;
@@ -436,4 +451,113 @@ fn set_frame(doc: &mut PagesDoc, id: u64, v: &Value) -> Result<Value> {
         }
     }
     Ok(json!("ok"))
+}
+
+/// MCP-shaped tool specs ({id, name, description, inputSchema}) for every
+/// pg.* command — the single source of truth the Session registry and the
+/// MCP server both read.
+pub fn command_specs() -> Vec<Value> {
+    let spec = |id: &str, desc: &str, props: Value, required: &[&str]| {
+        json!({
+            "id": id,
+            "name": id.replace('.', "_"),
+            "description": desc,
+            "inputSchema": {"type": "object", "properties": props, "required": required},
+        })
+    };
+    let s = |d: &str| json!({"type": "string", "description": d});
+    let n = |d: &str| json!({"type": "number", "description": d});
+    let o = |d: &str| json!({"type": "object", "description": d});
+    vec![
+        spec(
+            "pg.new",
+            "Create a new pages document (default 612x792pt Letter)",
+            json!({"name": s("name"), "w": n("page width pt"), "h": n("page height pt"), "margins": o("{top,right,bottom,left} pt")}),
+            &[],
+        ),
+        spec(
+            "pg.open",
+            "Open a .kpages document",
+            json!({"path": s("doc path")}),
+            &["path"],
+        ),
+        spec(
+            "pg.save",
+            "Save the pages document",
+            json!({"path": s("path; default <name>.kpages")}),
+            &[],
+        ),
+        spec(
+            "pg.json",
+            "Return the pages document's JSON state",
+            json!({}),
+            &[],
+        ),
+        spec(
+            "pg.addPage",
+            "Append a page (master: index or null)",
+            json!({"master": n("master index")}),
+            &[],
+        ),
+        spec(
+            "pg.addMaster",
+            "Add a master page template",
+            json!({"name": s("master name")}),
+            &[],
+        ),
+        spec(
+            "pg.removePage",
+            "Remove a page",
+            json!({"page": n("page index")}),
+            &["page"],
+        ),
+        spec(
+            "pg.duplicatePage",
+            "Clone a page with fresh frame ids, right after it",
+            json!({"page": n("page index")}),
+            &["page"],
+        ),
+        spec(
+            "pg.addFrame",
+            "Add a frame (kind: text|image|rect|line) on a page (default 0) or master",
+            json!({"page": n("page index"), "master": n("master index (wins over page)"), "kind": s("frame kind"), "x": n("pt"), "y": n("pt"), "w": n("pt"), "h": n("pt"), "text": s("text content"), "path": s("image path"), "fit": s("fill|fit|stretch"), "x2": n("line end x"), "y2": n("line end y")}),
+            &["kind"],
+        ),
+        spec(
+            "pg.setFrame",
+            "Edit a frame by global id (geometry + kind fields; 'master'/'page' not needed)",
+            json!({"frame": n("frame id")}),
+            &["frame"],
+        ),
+        spec(
+            "pg.removeFrame",
+            "Remove a frame by global id",
+            json!({"frame": n("frame id")}),
+            &["frame"],
+        ),
+        spec(
+            "pg.moveFrame",
+            "Move a frame onto another page or master",
+            json!({"frame": n("frame id"), "page": n("page index"), "master": n("master index")}),
+            &["frame"],
+        ),
+        spec(
+            "pg.setMaster",
+            "Assign/remove a page's master (master: index or null)",
+            json!({"page": n("page index"), "master": n("master index or null")}),
+            &["page"],
+        ),
+        spec(
+            "pg.render",
+            "Export the document to PDF",
+            json!({"out": s("output path")}),
+            &["out"],
+        ),
+        spec(
+            "pg.renderPng",
+            "Render a page to PNG at a dpi (needs out+dpi)",
+            json!({"page": n("page index"), "out": s("output path"), "dpi": n("render dpi, e.g. 96")}),
+            &["page", "out", "dpi"],
+        ),
+    ]
 }

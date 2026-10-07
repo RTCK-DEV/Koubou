@@ -2,9 +2,17 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+/// Menus are authored wholesale via `.commandsReplaced` — this is the only
+/// SwiftUI surface where the stock Edit-menu Undo/Redo can actually be
+/// replaced: `CommandGroup(replacing: .undoRedo)` keeps the AppKit items
+/// (permanently disabled — SwiftUI manages their state), responder-chain
+/// `undo:` on the app delegate is never consulted for them, and
+/// didFinishLaunching menu surgery is clobbered when SwiftUI rebuilds the
+/// main menu. Undo/redo here route to the active workspace's
+/// command-protocol history (doc./tl./pg.).
 @main
 struct KouApp: App {
-    @StateObject private var store = LibraryStore()
+    @StateObject private var store = LibraryStore.shared
 
     var body: some Scene {
         WindowGroup("koubou") {
@@ -13,19 +21,58 @@ struct KouApp: App {
                 .frame(minWidth: 1120, minHeight: 700)
         }
         .windowToolbarStyle(.unifiedCompact)
-        .commands {
-            CommandGroup(after: .newItem) {
+        .commandsReplaced {
+            CommandMenu("koubou") {
+                Button("About koubou") { NSApp.orderFrontStandardAboutPanel(nil) }
+                Divider()
+                Button("Hide koubou") { NSApp.hide(nil) }
+                    .keyboardShortcut("h", modifiers: .command)
+                Button("Quit koubou") { NSApp.terminate(nil) }
+                    .keyboardShortcut("q", modifiers: .command)
+            }
+            CommandMenu("File") {
+                Button("New Document") { store.newDocument() }
+                    .keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("Open Document…") { store.openDocument() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                Divider()
                 Button("Open Folder…") { store.pickFolder() }
                     .keyboardShortcut("o", modifiers: .command)
                 Divider()
-                Button("New Document") { store.newDocument() }
-                    .keyboardShortcut("n", modifiers: .command)
-                Button("Open Document…") { store.openDocument() }
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
-                Button("Import PDF as Document…") { store.doc.importPdf() }
-                Divider()
                 Button("New Timeline") { store.mode = .motion }
                 Button("New Pages Doc") { store.mode = .pages }
+                Divider()
+                Button("Import PDF as Document…") { store.doc.importPdf() }
+            }
+            CommandMenu("Edit") {
+                Button("Undo") { store.undo() }
+                    .keyboardShortcut("z", modifiers: .command)
+                Button("Redo") { store.redo() }
+                    .keyboardShortcut("z", modifiers: [.command, .shift])
+                Divider()
+                // standard editing actions — sent down the responder
+                // chain so text fields in any inspector work as usual
+                Button("Cut") { NSApp.sendAction(Selector(("cut:")), to: nil, from: nil) }
+                    .keyboardShortcut("x", modifiers: .command)
+                Button("Copy") { NSApp.sendAction(Selector(("copy:")), to: nil, from: nil) }
+                    .keyboardShortcut("c", modifiers: .command)
+                Button("Paste") { NSApp.sendAction(Selector(("paste:")), to: nil, from: nil) }
+                    .keyboardShortcut("v", modifiers: .command)
+                Button("Select All") { NSApp.sendAction(Selector(("selectAll:")), to: nil, from: nil) }
+                    .keyboardShortcut("a", modifiers: .command)
+            }
+            CommandMenu("Window") {
+                Button("Minimize") { NSApp.keyWindow?.miniaturize(nil) }
+                    .keyboardShortcut("m", modifiers: .command)
+                Button("Zoom") { NSApp.keyWindow?.zoom(nil) }
+                Divider()
+                Button("Close") { NSApp.keyWindow?.performClose(nil) }
+                    .keyboardShortcut("w", modifiers: .command)
+            }
+            CommandMenu("Help") {
+                Button("koubou Help") {
+                    NSWorkspace.shared.open(URL(string: "https://github.com/RTCK-reina/Koubou")!)
+                }
             }
         }
     }
@@ -82,6 +129,9 @@ struct StudioView: View {
 }
 
 final class LibraryStore: ObservableObject {
+    /// single instance — the app is one shared document/session world
+    static let shared = LibraryStore()
+
     @Published var photos: [Photo] = []
     @Published var folder: URL?
     @Published var selection: Photo?
@@ -116,6 +166,21 @@ final class LibraryStore: ObservableObject {
 
     /// Same idea for grade-version lists (they live in the sidecar file).
     var unsavedVersions: [String: [GradeVersion]] = [:]
+
+    private init() {}
+
+    /// undo/redo goes to the session that owns the active workspace —
+    /// the command protocol keeps per-domain history stacks.
+    func undo() { history("undo") }
+    func redo() { history("redo") }
+    private func history(_ op: String) {
+        switch mode {
+        case .doc: doc.dispatch(["id": "doc.\(op)"])
+        case .motion: motion.dispatch(["id": "tl.\(op)"])
+        case .pages: pages.dispatch(["id": "pg.\(op)"])
+        case .library: break
+        }
+    }
 
     /// distinct camera/lens names seen in the current folder (filter menus)
     var cameras: [String] { Array(Set(photos.map(\.camera).filter { !$0.isEmpty })).sorted() }

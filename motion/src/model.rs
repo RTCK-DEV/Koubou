@@ -132,6 +132,82 @@ impl Timeline {
         Some(self.tracks.get_mut(ti)?.clips.remove(ci))
     }
 
+    /// split clip `id` at timeline time `t`: the original covers the first
+    /// part, a new clip (returned id) covers the rest. Keyframes are split
+    /// at the cut and re-zeroed for the second half; the seam keeps the
+    /// outer fades (A keeps fade_in, B keeps fade_out).
+    pub fn split_clip(&mut self, id: u64, t: f64) -> Result<u64> {
+        let (ti, ci) = self
+            .find_clip(id)
+            .with_context(|| format!("clip {id} not found"))?;
+        let clip = self.tracks[ti].clips[ci].clone();
+        let local = t - clip.offset;
+        if !local.is_finite() || local <= 0.0 || local >= clip.duration() {
+            anyhow::bail!(
+                "split point {t} outside clip span {:.2}..{:.2}",
+                clip.offset,
+                clip.end()
+            );
+        }
+        // `clip` is already a clone, so split the keyframes in pure data
+        // first — indexing self.tracks mutably for four fields at once
+        // doesn't satisfy the borrow checker.
+        let split = |kfs: &[[f64; 2]]| -> (Vec<[f64; 2]>, Vec<[f64; 2]>) {
+            let (a_part, b_part): (Vec<[f64; 2]>, Vec<[f64; 2]>) =
+                kfs.iter().partition(|kf| kf[0] <= local);
+            (
+                a_part,
+                b_part
+                    .iter()
+                    .map(|kf| [(kf[0] - local).max(0.0), kf[1]])
+                    .collect(),
+            )
+        };
+        let (op_a, op_b) = split(&clip.opacity);
+        let (sc_a, sc_b) = split(&clip.scale);
+        let (x_a, x_b) = split(&clip.x);
+        let (y_a, y_b) = split(&clip.y);
+        let mut b = clip;
+        b.in_point += local;
+        b.offset = t;
+        b.opacity = op_b;
+        b.scale = sc_b;
+        b.x = x_b;
+        b.y = y_b;
+        {
+            let a = &mut self.tracks[ti].clips[ci];
+            a.out_point = a.in_point + local;
+            a.fade_out = 0.0;
+            a.opacity = op_a;
+            a.scale = sc_a;
+            a.x = x_a;
+            a.y = y_a;
+            a.sanitize();
+        }
+        b.fade_in = 0.0;
+        b.sanitize();
+        b.id = self.next_id;
+        self.next_id += 1;
+        let new_id = b.id;
+        self.tracks[ti].clips.insert(ci + 1, b);
+        Ok(new_id)
+    }
+
+    /// clone a clip onto the same track, parked right after the original
+    pub fn duplicate_clip(&mut self, id: u64) -> Result<u64> {
+        let (ti, ci) = self
+            .find_clip(id)
+            .with_context(|| format!("clip {id} not found"))?;
+        let mut c = self.tracks[ti].clips[ci].clone();
+        c.id = self.next_id;
+        self.next_id += 1;
+        c.offset += c.duration();
+        c.sanitize();
+        let new_id = c.id;
+        self.tracks[ti].clips.insert(ci + 1, c);
+        Ok(new_id)
+    }
+
     /// add a subtitle cue; `track` picks a subtitle track — when None the
     /// first subtitle track is used. Errors when none exists.
     pub fn add_cue(&mut self, track: Option<usize>, cue: Cue) -> Result<()> {
@@ -465,7 +541,7 @@ impl Cue {
         t >= self.t && t < self.end()
     }
 
-    fn sanitize(&mut self) {
+    pub(crate) fn sanitize(&mut self) {
         if !self.t.is_finite() {
             self.t = 0.0;
         }

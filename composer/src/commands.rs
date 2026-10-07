@@ -18,6 +18,10 @@ use crate::blend::BlendMode;
 use crate::composite::Composer;
 use crate::doc::{Document, Fill, Layer, LayerKind, Mask, Shape, Stroke, TextAlign, TextContent};
 
+/// max snapshots kept per domain (doc snapshots carry embedded rasters —
+/// bounded so scrubbing sliders doesn't grow memory without limit)
+const HISTORY_CAP: usize = 32;
+
 /// one app session: an imaging engine plus an optional open document,
 /// an optional motion timeline and an optional pages layout. `tl.*` and
 /// `pg.*` ids are delegated to those crates — one Session, every domain.
@@ -26,6 +30,51 @@ pub struct Session {
     pub composer: Option<Composer>,
     motion: Option<koubou_motion::TlSession>,
     pages: Option<koubou_pages::PgSession>,
+    /// snapshot stacks per domain ("doc"/"tl"/"pg") for *.undo/*.redo
+    undo: std::collections::HashMap<&'static str, std::collections::VecDeque<Value>>,
+    redo: std::collections::HashMap<&'static str, std::collections::VecDeque<Value>>,
+}
+
+/// which history domain a command belongs to
+fn history_domain(id: &str) -> Option<&'static str> {
+    if id.starts_with("doc.") {
+        Some("doc")
+    } else if id.starts_with("tl.") {
+        Some("tl")
+    } else if id.starts_with("pg.") {
+        Some("pg")
+    } else {
+        None
+    }
+}
+
+/// commands that change document state (snapshot before them); reads,
+/// renders, saves and the history commands themselves are excluded.
+fn is_mutating(id: &str) -> bool {
+    !matches!(
+        id,
+        "doc.json"
+            | "doc.render"
+            | "doc.exportLayer"
+            | "doc.info"
+            | "doc.save"
+            | "doc.undo"
+            | "doc.redo"
+            | "tl.json"
+            | "tl.probe"
+            | "tl.renderFrame"
+            | "tl.render"
+            | "tl.detectSilence"
+            | "tl.save"
+            | "tl.undo"
+            | "tl.redo"
+            | "pg.json"
+            | "pg.render"
+            | "pg.renderPng"
+            | "pg.save"
+            | "pg.undo"
+            | "pg.redo"
+    )
 }
 
 impl Session {
@@ -35,11 +84,181 @@ impl Session {
             composer: None,
             motion: None,
             pages: None,
+            undo: std::collections::HashMap::new(),
+            redo: std::collections::HashMap::new(),
         })
+    }
+
+    /// serialised state of one domain's document (Null when none open)
+    fn domain_snapshot(&self, d: &str) -> Value {
+        let inner = match d {
+            "doc" => self
+                .composer
+                .as_ref()
+                .and_then(|c| serde_json::to_value(&c.doc).ok()),
+            "tl" => self
+                .motion
+                .as_ref()
+                .and_then(|m| m.timeline.as_ref())
+                .and_then(|t| serde_json::to_value(t).ok()),
+            "pg" => self
+                .pages
+                .as_ref()
+                .and_then(|p| p.doc.as_ref())
+                .and_then(|d| serde_json::to_value(d).ok()),
+            _ => None,
+        };
+        inner.unwrap_or(Value::Null)
+    }
+
+    /// replace one domain's document state from a snapshot
+    fn domain_restore(&mut self, d: &str, snap: Value) -> Result<()> {
+        match d {
+            "doc" => {
+                if snap.is_null() {
+                    self.composer = None;
+                } else {
+                    let doc: Document = serde_json::from_value(snap).context("restore document")?;
+                    self.composer = Some(Composer::new(doc)?);
+                }
+            }
+            "tl" => {
+                let s = self
+                    .motion
+                    .get_or_insert_with(koubou_motion::TlSession::new);
+                s.timeline = if snap.is_null() {
+                    None
+                } else {
+                    Some(serde_json::from_value(snap).context("restore timeline")?)
+                };
+            }
+            "pg" => {
+                let s = self.pages.get_or_insert_with(koubou_pages::PgSession::new);
+                s.doc = if snap.is_null() {
+                    None
+                } else {
+                    Some(serde_json::from_value(snap).context("restore pages doc")?)
+                };
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn history(&mut self, id: &str) -> Result<Value> {
+        let dom = history_domain(id).context("not a history command")?;
+        let undoing = id.ends_with("undo");
+        let src = if undoing {
+            &mut self.undo
+        } else {
+            &mut self.redo
+        };
+        let Some(snap) = src.get_mut(dom).and_then(|s| s.pop_back()) else {
+            return Ok(json!({"changed": false}));
+        };
+        let cur = self.domain_snapshot(dom);
+        self.domain_restore(dom, snap)?;
+        let dst = if undoing {
+            &mut self.redo
+        } else {
+            &mut self.undo
+        };
+        dst.entry(dom).or_default().push_back(cur);
+        Ok(json!({"changed": true}))
+    }
+
+    /// run a JSON list of commands in order. atomic (default): on the first
+    /// failure every domain state touched so far is rolled back and the
+    /// error is reported with the failing index. `"atomic": false` runs the
+    /// whole list and returns each sub-response.
+    fn run_batch(&mut self, v: &Value) -> Result<Value> {
+        let list = v
+            .get("commands")
+            .and_then(Value::as_array)
+            .context("batch needs 'commands': [...]")?;
+        let atomic = v.get("atomic").and_then(Value::as_bool).unwrap_or(true);
+        // pre-state for rollback + per-domain undo stack sizes so a rolled
+        // back batch leaves no half-committed history entries
+        let domains = ["doc", "tl", "pg"];
+        let snaps: Vec<Value> = domains.iter().map(|d| self.domain_snapshot(d)).collect();
+        let undo_lens: Vec<usize> = domains
+            .iter()
+            .map(|d| self.undo.get(*d).map(|s| s.len()).unwrap_or(0))
+            .collect();
+        let mut results = Vec::with_capacity(list.len());
+        for (i, sub) in list.iter().enumerate() {
+            let r = self.dispatch_one(sub, true);
+            let ok = r.get("ok") == Some(&Value::Bool(true));
+            results.push(r.clone());
+            if !ok {
+                if atomic {
+                    for (i2, (d, snap)) in domains.iter().zip(snaps.iter()).enumerate() {
+                        self.domain_restore(d, snap.clone())?;
+                        if let Some(s) = self.undo.get_mut(*d) {
+                            s.truncate(undo_lens[i2]);
+                        }
+                    }
+                    let err = r
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("error")
+                        .to_string();
+                    anyhow::bail!("batch command {i} failed: {err}");
+                }
+            }
+        }
+        Ok(json!({"results": results}))
     }
 
     pub fn dispatch(&mut self, v: &Value) -> Value {
         let id = v.get("id").and_then(Value::as_str).unwrap_or("");
+        // history + batch are session-level, not domain commands
+        if matches!(
+            id,
+            "doc.undo" | "doc.redo" | "tl.undo" | "tl.redo" | "pg.undo" | "pg.redo"
+        ) {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.history(id)));
+            return match r {
+                Ok(Ok(result)) => json!({"ok": true, "result": result}),
+                Ok(Err(e)) => json!({"ok": false, "error": format!("{e:#}")}),
+                Err(_) => json!({"ok": false, "error": format!("command '{id}' panicked")}),
+            };
+        }
+        if id == "batch" {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_batch(v)));
+            return match r {
+                Ok(Ok(result)) => json!({"ok": true, "result": result}),
+                Ok(Err(e)) => json!({"ok": false, "error": format!("{e:#}")}),
+                Err(_) => json!({"ok": false, "error": "batch panicked"}),
+            };
+        }
+        self.dispatch_one(v, true)
+    }
+
+    fn dispatch_one(&mut self, v: &Value, record: bool) -> Value {
+        let id = v.get("id").and_then(Value::as_str).unwrap_or("");
+        // capture pre-state BEFORE running; commit it to the undo stack
+        // only when the command actually succeeded.
+        let dom = if record {
+            history_domain(id)
+                .filter(|_| is_mutating(id))
+                .map(|d| (d, self.domain_snapshot(d)))
+        } else {
+            None
+        };
+        let r = self.dispatch_routed(id, v);
+        if let (Some((d, snap)), true) = (dom, r.get("ok") == Some(&Value::Bool(true))) {
+            let s = self.undo.entry(d).or_default();
+            s.push_back(snap);
+            while s.len() > HISTORY_CAP {
+                s.pop_front();
+            }
+            self.redo.entry(d).or_default().clear();
+        }
+        r
+    }
+
+    fn dispatch_routed(&mut self, id: &str, v: &Value) -> Value {
         // domain routing: tl.* → motion timeline session, pg.* → pages
         // session. Their dispatch(id, v) -> Result<Value> mirrors run();
         // same never-crash guard + envelope at this edge.
@@ -72,9 +291,19 @@ impl Session {
         }
     }
 
+    /// every command this session understands, as MCP-shaped tool specs
+    /// ({id, name, description, inputSchema}). `name` is the id with '.'
+    /// replaced by '_' — MCP tool names cannot contain dots.
+    pub fn command_specs() -> Vec<Value> {
+        let mut out = crate::specs::base();
+        out.extend(koubou_motion::command_specs());
+        out.extend(koubou_pages::command_specs());
+        out
+    }
+
     /// the command ids this dispatcher understands (parity checks read this)
     pub fn command_ids() -> &'static [&'static str] {
-        &[
+        static IDS: &[&str] = &[
             "ping",
             "commands",
             "scan",
@@ -86,56 +315,85 @@ impl Session {
             "sidecar.write",
             "setRating",
             "setLabel",
+            "batch",
             "doc.new",
             "doc.fromPhoto",
             "doc.open",
             "doc.save",
             "doc.json",
+            "doc.info",
             "doc.importPsd",
             "doc.addLayer",
             "doc.setLayer",
             "doc.removeLayer",
+            "doc.duplicateLayer",
             "doc.reorder",
+            "doc.mergeDown",
+            "doc.flatten",
+            "doc.resize",
+            "doc.crop",
+            "doc.setBackdrop",
             "doc.render",
+            "doc.exportLayer",
+            "doc.maskPaint",
+            "doc.maskInvert",
             "doc.addShape",
             "doc.shapeSet",
             "doc.shapeRemove",
-            "doc.maskPaint",
+            "doc.undo",
+            "doc.redo",
             // motion domain (koubou-motion / .kmotion)
             "tl.new",
             "tl.open",
             "tl.save",
             "tl.json",
             "tl.addTrack",
+            "tl.setTrack",
+            "tl.removeTrack",
             "tl.addClip",
             "tl.setClip",
             "tl.removeClip",
+            "tl.splitClip",
+            "tl.duplicateClip",
             "tl.addCue",
+            "tl.setCue",
+            "tl.removeCue",
             "tl.probe",
             "tl.renderFrame",
             "tl.render",
             "tl.detectSilence",
             "tl.generateClip",
+            "tl.undo",
+            "tl.redo",
             // pages domain (koubou-pages / .kpages)
             "pg.new",
             "pg.open",
             "pg.save",
             "pg.json",
             "pg.addPage",
+            "pg.addMaster",
             "pg.removePage",
+            "pg.duplicatePage",
             "pg.addFrame",
             "pg.setFrame",
             "pg.removeFrame",
+            "pg.moveFrame",
             "pg.setMaster",
             "pg.render",
             "pg.renderPng",
-        ]
+            "pg.undo",
+            "pg.redo",
+        ];
+        IDS
     }
 
     fn run(&mut self, id: &str, v: &Value) -> Result<Value> {
         match id {
             "ping" => Ok(json!({"name": "koubou", "version": env!("CARGO_PKG_VERSION")})),
-            "commands" => Ok(json!(Self::command_ids())),
+            "commands" => Ok(json!({
+                "ids": Self::command_ids(),
+                "tools": Self::command_specs(),
+            })),
             "scan" => {
                 let f = req_str(v, "folder")?;
                 let entries = self.engine.scan(Path::new(&f))?;
@@ -283,6 +541,98 @@ impl Session {
                 let c = self.composer.as_mut().context("no document")?;
                 mask_paint(&mut c.doc, v)
             }
+            "doc.info" => {
+                let c = self.composer.as_ref().context("no document")?;
+                Ok(json!({
+                    "name": c.doc.name,
+                    "w": c.doc.width,
+                    "h": c.doc.height,
+                    "layers": c.doc.layers.len(),
+                    "backdrop": c.doc.backdrop,
+                }))
+            }
+            "doc.duplicateLayer" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let i = c.doc.index_of(id).context("layer not found")?;
+                let mut l = c.doc.layers[i].clone();
+                l.name = format!("{} copy", l.name);
+                l.x += 16;
+                l.y += 16;
+                let new_id = c.doc.add_layer_at(l, i + 1);
+                Ok(json!({"layerId": new_id}))
+            }
+            "doc.mergeDown" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let new_id = c.merge_down(id)?;
+                Ok(json!({"layerId": new_id}))
+            }
+            "doc.flatten" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let name = v.get("name").and_then(Value::as_str).unwrap_or("Flattened");
+                let id = c.flatten(name)?;
+                Ok(json!({"layerId": id}))
+            }
+            "doc.resize" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let w = req_u64(v, "w")? as u32;
+                let h = req_u64(v, "h")? as u32;
+                if w == 0 || h == 0 {
+                    anyhow::bail!("doc.resize needs positive w/h");
+                }
+                c.doc.width = w;
+                c.doc.height = h;
+                c.doc.bump_all_gens();
+                Ok(json!({"w": w, "h": h}))
+            }
+            "doc.crop" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let x = v.get("x").and_then(Value::as_i64).unwrap_or(0) as i32;
+                let y = v.get("y").and_then(Value::as_i64).unwrap_or(0) as i32;
+                let w = req_u64(v, "w")? as u32;
+                let h = req_u64(v, "h")? as u32;
+                for l in c.doc.layers.iter_mut() {
+                    l.x -= x;
+                    l.y -= y;
+                }
+                c.doc.width = w;
+                c.doc.height = h;
+                c.doc.bump_all_gens();
+                Ok(json!({"w": w, "h": h}))
+            }
+            "doc.setBackdrop" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let col = v
+                    .get("color")
+                    .and_then(|c| serde_json::from_value::<[f32; 4]>(c.clone()).ok())
+                    .context("need 'color': [r,g,b,a]")?;
+                c.doc.backdrop = col;
+                Ok(json!("ok"))
+            }
+            "doc.exportLayer" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let img = c.render_layer(id)?;
+                write_image(&img, v.get("out").and_then(Value::as_str))
+            }
+            "doc.maskInvert" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let (dw, dh) = (c.doc.width, c.doc.height);
+                let l = c.doc.layer_mut(id).context("layer not found")?;
+                match &mut l.mask {
+                    Some(m) => m.inverted = !m.inverted,
+                    None => {
+                        // inverting an absent mask = fully hidden
+                        let mut m = Mask::full(dw, dh);
+                        m.inverted = true;
+                        l.mask = Some(m);
+                    }
+                }
+                l.gen += 1;
+                Ok(json!("ok"))
+            }
             "doc.addShape" => {
                 let c = self.composer.as_mut().context("no document")?;
                 let id = layer_id(v)?;
@@ -389,17 +739,31 @@ fn recipe_arg(v: &Value) -> Result<Recipe> {
 }
 
 fn write_image(img: &koubou_core::develop::RgbaImage, out: Option<&str>) -> Result<Value> {
-    let rgba = image::RgbaImage::from_raw(img.width, img.height, img.data.clone())
-        .context("image buffer")?;
+    // encode straight from the pixel buffer — no intermediate image clone
+    use image::codecs::png::PngEncoder;
+    use image::ImageEncoder as _;
+    let encode = |w: &mut dyn std::io::Write| -> Result<()> {
+        PngEncoder::new(w)
+            .write_image(
+                &img.data,
+                img.width,
+                img.height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(Into::into)
+    };
     match out {
         Some(path) => {
-            rgba.save(path).with_context(|| format!("save {path}"))?;
+            let mut f = std::io::BufWriter::new(
+                std::fs::File::create(path).with_context(|| format!("create {path}"))?,
+            );
+            encode(&mut f).with_context(|| format!("save {path}"))?;
             Ok(json!({"path": path, "w": img.width, "h": img.height}))
         }
         None => {
             use base64::Engine as _;
             let mut buf = std::io::Cursor::new(Vec::new());
-            rgba.write_to(&mut buf, image::ImageFormat::Png)?;
+            encode(&mut buf)?;
             Ok(json!({
                 "pngB64": base64::engine::general_purpose::STANDARD.encode(buf.into_inner()),
                 "w": img.width,
@@ -691,4 +1055,349 @@ fn mask_paint(doc: &mut Document, v: &Value) -> Result<Value> {
     }
     l.gen += 1;
     Ok(json!("ok"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s() -> Session {
+        Session::new().expect("engine")
+    }
+
+    fn d(v: &Value) -> Value {
+        v.clone()
+    }
+
+    fn new_doc(s: &mut Session) {
+        let r = s.dispatch(&d(&json!({"id": "doc.new", "name": "t", "w": 64, "h": 48})));
+        assert_eq!(r["ok"], true, "doc.new failed: {r}");
+    }
+
+    #[test]
+    fn undo_redo_roundtrip() {
+        let mut s = s();
+        new_doc(&mut s);
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "a", "color": [1,0,0,1]}),
+        ));
+        assert_eq!(r["ok"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["layers"].as_array().unwrap().len(), 1);
+
+        let u = s.dispatch(&d(&json!({"id": "doc.undo"})));
+        assert_eq!(u["result"]["changed"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["layers"].as_array().unwrap().len(), 0);
+
+        let r = s.dispatch(&d(&json!({"id": "doc.redo"})));
+        assert_eq!(r["result"]["changed"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["layers"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["result"]["layers"][0]["name"], "a");
+
+        // doc.new is itself undoable — undoing it restores "no document"
+        let u = s.dispatch(&d(&json!({"id": "doc.undo"})));
+        assert_eq!(u["result"]["changed"], true);
+        let u = s.dispatch(&d(&json!({"id": "doc.undo"})));
+        assert_eq!(u["result"]["changed"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["ok"], false, "undo should have removed the document");
+        // stack drained
+        let u = s.dispatch(&d(&json!({"id": "doc.undo"})));
+        assert_eq!(u["result"]["changed"], false);
+    }
+
+    #[test]
+    fn new_edit_clears_redo() {
+        let mut s = s();
+        new_doc(&mut s);
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "a", "color": [1,0,0,1]}),
+        ));
+        s.dispatch(&d(&json!({"id": "doc.undo"})));
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "b", "color": [0,1,0,1]}),
+        ));
+        let r = s.dispatch(&d(&json!({"id": "doc.redo"})));
+        assert_eq!(
+            r["result"]["changed"], false,
+            "redo must be cleared by a new edit"
+        );
+    }
+
+    #[test]
+    fn batch_atomic_rolls_back() {
+        let mut s = s();
+        new_doc(&mut s);
+        let r = s.dispatch(&d(&json!({
+            "id": "batch",
+            "commands": [
+                {"id": "doc.addLayer", "kind": "fill", "name": "a", "color": [1,0,0,1]},
+                {"id": "doc.nonsense"},
+                {"id": "doc.addLayer", "kind": "fill", "name": "b", "color": [0,1,0,1]}
+            ]
+        })));
+        assert_eq!(r["ok"], false);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(
+            doc["result"]["layers"].as_array().unwrap().len(),
+            0,
+            "failed atomic batch must leave no edits"
+        );
+        // and no history entries either
+        let u = s.dispatch(&d(&json!({"id": "doc.undo"})));
+        assert_eq!(u["result"]["changed"], true, "doc.new itself is undoable");
+        s.dispatch(&d(&json!({"id": "doc.redo"})));
+    }
+
+    #[test]
+    fn batch_non_atomic_collects_results() {
+        let mut s = s();
+        new_doc(&mut s);
+        let r = s.dispatch(&d(&json!({
+            "id": "batch", "atomic": false,
+            "commands": [
+                {"id": "doc.addLayer", "kind": "fill", "name": "a", "color": [1,0,0,1]},
+                {"id": "doc.nonsense"},
+                {"id": "doc.addLayer", "kind": "fill", "name": "b", "color": [0,1,0,1]}
+            ]
+        })));
+        assert_eq!(r["ok"], true);
+        let res = r["result"]["results"].as_array().unwrap();
+        assert_eq!(res[0]["ok"], true);
+        assert_eq!(res[1]["ok"], false);
+        assert_eq!(res[2]["ok"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["layers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn duplicate_merge_flatten_export() {
+        let mut s = s();
+        new_doc(&mut s);
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "bottom", "color": [1,0,0,1]}),
+        ));
+        s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "fill", "name": "top", "color": [0,0,1,0.5]}),
+        ));
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let top_id = doc["result"]["layers"][1]["id"].as_u64().unwrap();
+
+        let r = s.dispatch(&d(&json!({"id": "doc.duplicateLayer", "layer": top_id})));
+        assert_eq!(r["ok"], true);
+        assert_eq!(
+            s.dispatch(&d(&json!({"id": "doc.json"})))["result"]["layers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let r = s.dispatch(&d(&json!({"id": "doc.mergeDown", "layer": top_id})));
+        assert_eq!(r["ok"], true, "mergeDown: {r}");
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let layers = doc["result"]["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 2);
+        // merged raster takes the bottom slot, keeps the lower layer's name
+        assert_eq!(layers[0]["type"], "raster");
+        assert_eq!(layers[0]["name"], "bottom");
+        let merged_id = layers[0]["id"].as_u64().unwrap();
+
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.exportLayer", "layer": merged_id, "out": "/tmp/kb_export_test.png"}),
+        ));
+        assert_eq!(r["ok"], true, "exportLayer: {r}");
+        assert!(std::path::Path::new("/tmp/kb_export_test.png").exists());
+
+        let r = s.dispatch(&d(&json!({"id": "doc.flatten", "name": "flat"})));
+        assert_eq!(r["ok"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let layers = doc["result"]["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0]["name"], "flat");
+    }
+
+    #[test]
+    fn resize_crop_maskinvert() {
+        let mut s = s();
+        new_doc(&mut s);
+        s.dispatch(&d(&json!({"id": "doc.addLayer", "kind": "fill", "name": "bg", "color": [1,1,1,1], "x": 10, "y": 5})));
+
+        let r = s.dispatch(&d(&json!({"id": "doc.resize", "w": 100, "h": 80})));
+        assert_eq!(r["ok"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["width"], 100);
+
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.crop", "x": 10, "y": 5, "w": 32, "h": 24}),
+        ));
+        assert_eq!(r["ok"], true, "crop: {r}");
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["width"], 32);
+        assert_eq!(doc["result"]["height"], 24);
+        assert_eq!(doc["result"]["layers"][0]["x"], 0);
+        assert_eq!(doc["result"]["layers"][0]["y"], 0);
+
+        let lid = doc["result"]["layers"][0]["id"].as_u64().unwrap();
+        let r = s.dispatch(&d(&json!({"id": "doc.maskInvert", "layer": lid})));
+        assert_eq!(r["ok"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["layers"][0]["mask"]["inverted"], true);
+        let r = s.dispatch(&d(&json!({"id": "doc.maskInvert", "layer": lid})));
+        assert_eq!(doc["result"]["layers"][0]["mask"]["inverted"], true);
+        assert_eq!(r["ok"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["layers"][0]["mask"]["inverted"], false);
+    }
+
+    #[test]
+    fn specs_cover_every_command() {
+        // the MCP tool list is generated from command_specs — it must cover
+        // exactly the dispatchable command set, or a tool silently 404s.
+        let ids = Session::command_ids();
+        let specs = Session::command_specs();
+        let spec_ids: Vec<&str> = specs
+            .iter()
+            .filter_map(|s| s.get("id").and_then(Value::as_str))
+            .collect();
+        for id in ids {
+            assert!(spec_ids.contains(id), "command '{id}' has no spec");
+        }
+        for sid in &spec_ids {
+            assert!(ids.contains(sid), "spec '{sid}' has no command");
+        }
+        // MCP names must be unique and dot-free
+        let names: Vec<&str> = specs
+            .iter()
+            .filter_map(|s| s.get("name").and_then(Value::as_str))
+            .collect();
+        assert_eq!(names.len(), spec_ids.len());
+        for (i, a) in names.iter().enumerate() {
+            assert!(!a.contains('.'));
+            for b in &names[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn tl_undo_isolated_from_doc() {
+        let mut s = s();
+        new_doc(&mut s);
+        let r = s.dispatch(&d(&json!({"id": "tl.new", "w": 640, "h": 360, "fps": 30})));
+        assert_eq!(r["ok"], true, "tl.new: {r}");
+        let r = s.dispatch(&d(
+            &json!({"id": "tl.addTrack", "kind": "video", "name": "v1"}),
+        ));
+        assert_eq!(r["ok"], true);
+        let u = s.dispatch(&d(&json!({"id": "tl.undo"})));
+        assert_eq!(u["result"]["changed"], true);
+        let t = s.dispatch(&d(&json!({"id": "tl.json"})));
+        assert_eq!(t["result"]["tracks"].as_array().unwrap().len(), 0);
+        // doc untouched by tl.undo
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert!(doc["ok"] == true);
+    }
+
+    #[test]
+    fn tl_split_duplicate_track_cue_ops() {
+        let mut s = s();
+        s.dispatch(&d(&json!({"id": "tl.new", "w": 320, "h": 180, "fps": 30})));
+        s.dispatch(&d(
+            &json!({"id": "tl.addTrack", "kind": "video", "name": "v1"}),
+        ));
+        let r = s.dispatch(&d(&json!({
+            "id": "tl.addClip", "track": 0, "text": "hello", "dur": 4.0, "offset": 0.0
+        })));
+        assert_eq!(r["ok"], true, "addClip: {r}");
+        let clip = r["result"]["clipId"].as_u64().unwrap();
+
+        let r = s.dispatch(&d(&json!({"id": "tl.splitClip", "clip": clip, "t": 1.5})));
+        assert_eq!(r["ok"], true, "splitClip: {r}");
+        let t = s.dispatch(&d(&json!({"id": "tl.json"})));
+        let clips = &t["result"]["tracks"][0]["clips"];
+        assert_eq!(clips.as_array().unwrap().len(), 2);
+        assert_eq!(clips[0]["outPoint"], json!(1.5));
+        assert_eq!(clips[1]["offset"], json!(1.5));
+
+        let dup_clip = clips[1]["id"].as_u64().unwrap();
+        let r = s.dispatch(&d(&json!({"id": "tl.duplicateClip", "clip": dup_clip})));
+        assert_eq!(r["ok"], true, "duplicateClip: {r}");
+        let t = s.dispatch(&d(&json!({"id": "tl.json"})));
+        assert_eq!(
+            t["result"]["tracks"][0]["clips"].as_array().unwrap().len(),
+            3
+        );
+
+        let r = s.dispatch(&d(
+            &json!({"id": "tl.setTrack", "track": 0, "name": "renamed", "muted": true}),
+        ));
+        assert_eq!(r["ok"], true);
+        let t = s.dispatch(&d(&json!({"id": "tl.json"})));
+        assert_eq!(t["result"]["tracks"][0]["name"], "renamed");
+        assert_eq!(t["result"]["tracks"][0]["muted"], true);
+
+        s.dispatch(&d(&json!({"id": "tl.addTrack", "kind": "subtitle"})));
+        s.dispatch(&d(
+            &json!({"id": "tl.addCue", "t": 0.0, "dur": 1.0, "text": "hi"}),
+        ));
+        let r = s.dispatch(&d(
+            &json!({"id": "tl.setCue", "index": 0, "text": "bye", "t": 2.0}),
+        ));
+        assert_eq!(r["ok"], true, "setCue: {r}");
+        let t = s.dispatch(&d(&json!({"id": "tl.json"})));
+        assert_eq!(t["result"]["tracks"][1]["cues"][0]["text"], "bye");
+        let r = s.dispatch(&d(&json!({"id": "tl.removeCue", "index": 0})));
+        assert_eq!(r["ok"], true);
+
+        // splitting outside a clip errors, not panics
+        let r = s.dispatch(&d(&json!({"id": "tl.splitClip", "clip": clip, "t": 99.0})));
+        assert_eq!(r["ok"], false);
+        let r = s.dispatch(&d(&json!({"id": "tl.removeTrack", "track": 0})));
+        assert_eq!(r["ok"], true);
+        let t = s.dispatch(&d(&json!({"id": "tl.json"})));
+        assert_eq!(t["result"]["tracks"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pg_duplicate_move_undo() {
+        let mut s = s();
+        s.dispatch(&d(&json!({"id": "pg.new", "name": "p"})));
+        s.dispatch(&d(&json!({"id": "pg.addPage"})));
+        let r = s.dispatch(&d(&json!({
+            "id": "pg.addFrame", "page": 0, "kind": "rect", "x": 10.0, "y": 10.0, "w": 50.0, "h": 20.0
+        })));
+        assert_eq!(r["ok"], true, "addFrame: {r}");
+        let fid = r["result"]["frame"].as_u64().unwrap();
+
+        let r = s.dispatch(&d(&json!({"id": "pg.duplicatePage", "page": 0})));
+        assert_eq!(r["ok"], true);
+        let p = s.dispatch(&d(&json!({"id": "pg.json"})));
+        assert_eq!(p["result"]["pages"].as_array().unwrap().len(), 2);
+        // duplicated page's frame has a different id
+        let dup_fid = p["result"]["pages"][1]["frames"][0]["id"].as_u64().unwrap();
+        assert_ne!(fid, dup_fid);
+
+        let r = s.dispatch(&d(&json!({"id": "pg.moveFrame", "frame": fid, "page": 1})));
+        assert_eq!(r["ok"], true, "moveFrame: {r}");
+        let p = s.dispatch(&d(&json!({"id": "pg.json"})));
+        assert_eq!(
+            p["result"]["pages"][0]["frames"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(
+            p["result"]["pages"][1]["frames"].as_array().unwrap().len(),
+            2
+        );
+
+        let u = s.dispatch(&d(&json!({"id": "pg.undo"})));
+        assert_eq!(u["result"]["changed"], true);
+        let p = s.dispatch(&d(&json!({"id": "pg.json"})));
+        assert_eq!(
+            p["result"]["pages"][0]["frames"].as_array().unwrap().len(),
+            1
+        );
+    }
 }

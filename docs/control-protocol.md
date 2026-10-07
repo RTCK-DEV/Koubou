@@ -58,9 +58,32 @@ Images: pass `out` to write a PNG file; omit it for `{"pngB64","w","h"}`.
 | `doc.setLayer` | `layer` + props to change | `"ok"` |
 | `doc.removeLayer` | `layer` | `"ok"` |
 | `doc.reorder` | `layer`, `to` (0 = bottom) | `"ok"` |
+| `doc.duplicateLayer` | `layer` | `{"layerId"}` |
+| `doc.mergeDown` | `layer` | `{"layerId"}` — raster-merges with the layer below |
+| `doc.flatten` | `name`? | `{"layerId"}` — one raster layer |
+| `doc.resize` | `w`, `h` | `"ok"` — canvas only, layers keep positions |
+| `doc.crop` | `x`, `y`, `w`, `h` | `"ok"` — canvas + shifts layers by (-x,-y) |
+| `doc.setBackdrop` | `color` [r,g,b,a] | `"ok"` |
+| `doc.exportLayer` | `layer`, `out`? | PNG file or `{"pngB64"}` — the layer's own pixels |
 | `doc.maskPaint` | `layer`, `cx`, `cy`, `r`, `value`, `softness` | `"ok"` |
+| `doc.maskInvert` | `layer` | `"ok"` — toggles `mask.inverted` (creates an inverted mask if none) |
+| `doc.info` | — | w/h/layer count/duplicated-flag |
+| `doc.undo` / `doc.redo` | — | `{"changed": bool}` |
 
 Note the layer-id param name is **`layer`** — `"id"` is the command name.
+
+## History (undo/redo) and batch
+
+Every mutating `doc.*`/`tl.*`/`pg.*` command pushes a pre-state snapshot of
+its domain onto that domain's undo stack (cap 32). Undo/redo are per-domain:
+`doc.undo`, `tl.undo`, `pg.undo` (+ `.redo`). Reads (`*.json`, `*.render`,
+`*.save`, `*.probe`) and history commands themselves are not recorded.
+
+`{"id":"batch","commands":[…],"atomic":true}` runs a command list.
+Atomic (default): the first failure rolls back every domain snapshot and
+the undo stacks — a failed batch leaves no state and no history.
+`"atomic":false` runs all commands and returns `{"results":[<envelope>…]}`.
+Sub-commands record undo history individually.
 
 ### `doc.addLayer` kinds
 
@@ -110,11 +133,17 @@ The same dispatch, routed to the timeline session. Envelope identical.
 | `tl.new` | `w`, `h`, `fps`, `name`? |
 | `tl.open` / `tl.save` | `path` |
 | `tl.json` | — |
-| `tl.addTrack` | `kind` video\|audio\|subtitle |
-| `tl.addClip` | `track`, `src`, `in`?, `out`?, `offset`? |
-| `tl.setClip` | `clip` + `in`/`out`/`offset`/`opacity`/`scale`/`fadeIn`/`fadeOut` |
+| `tl.addTrack` | `kind` video\|audio\|subtitle, `name`?, `muted`? |
+| `tl.setTrack` | `track`, `name`?, `muted`? |
+| `tl.removeTrack` | `track` |
+| `tl.addClip` | `track`, `src` or `text`, `in`?, `out`?, `dur`?, `offset`? |
+| `tl.setClip` | `clip` + `in`/`out`/`offset`/`opacity`/`scale`/`x`/`y`/`fadeIn`/`fadeOut` — scalars or keyframe lists |
 | `tl.removeClip` | `clip` |
-| `tl.addCue` | `t`, `dur`, `text` |
+| `tl.splitClip` | `clip`, `t` (timeline sec) → `{"clipId"}` — splits keyframes, keeps fades at the outer edges |
+| `tl.duplicateClip` | `clip` → `{"clipId"}` — clone parked right after |
+| `tl.addCue` | `t`, `dur`, `text`, `track`? (default: first subtitle track) |
+| `tl.setCue` / `tl.removeCue` | `index`, `track`? |
+| `tl.undo` / `tl.redo` | — |
 | `tl.probe` | `path` — ffprobe JSON |
 | `tl.renderFrame` | `t` → `{"pngB64":…}` or `out` |
 | `tl.render` | `out` — mp4 via ffmpeg |
@@ -129,8 +158,12 @@ The same dispatch, routed to the timeline session. Envelope identical.
 | `pg.open` / `pg.save` | `path` |
 | `pg.json` | — |
 | `pg.addPage` / `pg.removePage` | `page`? |
-| `pg.setMaster` | `page`, master name |
-| `pg.addFrame` | `page`, `kind` text\|image\|rect\|line + `x,y,w,h` (pt) |
-| `pg.setFrame` / `pg.removeFrame` | `page`, `frame` |
+| `pg.duplicatePage` | `page` → `{"page"}` — clone with fresh frame ids |
+| `pg.addMaster` | `name`? |
+| `pg.setMaster` | `page`, `master` (index or null) |
+| `pg.addFrame` | `page` or `master`, `kind` text\|image\|rect\|line + `x,y,w,h` (pt) |
+| `pg.setFrame` / `pg.removeFrame` | `frame` (global id) |
+| `pg.moveFrame` | `frame`, `page` or `master` |
+| `pg.undo` / `pg.redo` | — |
 | `pg.render` | `out` — PDF 1.4 |
 | `pg.renderPng` | `page`, `out`/`pngB64`, `maxPx`? |

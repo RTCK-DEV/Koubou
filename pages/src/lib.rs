@@ -18,4 +18,4 @@ pub mod text;
 pub use model::{
     Frame, FrameKind, FrameTarget, ImageFit, Margins, MasterPage, Page, PagesDoc, Stroke, TextAlign,
 };
-pub use session::PgSession;
+pub use session::{command_specs, PgSession};

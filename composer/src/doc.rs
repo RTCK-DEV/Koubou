@@ -70,6 +70,41 @@ impl Document {
         id
     }
 
+    /// add a layer at a specific stack index (0 = bottom); id is assigned
+    /// fresh and nested group children get fresh ids too so they never
+    /// collide with the compositor's (id, gen) cache.
+    pub fn add_layer_at(&mut self, mut l: Layer, at: usize) -> u64 {
+        Self::reassign_ids(&mut l, &mut self.next_id);
+        let id = l.id;
+        self.layers.insert(at.min(self.layers.len()), l);
+        id
+    }
+
+    fn reassign_ids(l: &mut Layer, next: &mut u64) {
+        l.id = *next;
+        *next += 1;
+        l.gen += 1;
+        if let LayerKind::Group { children } = &mut l.kind {
+            for c in children.iter_mut() {
+                Self::reassign_ids(c, next);
+            }
+        }
+    }
+
+    /// invalidate every layer's cached pixels (canvas resize / crop —
+    /// fills, shapes and masks all rasterize in doc space)
+    pub fn bump_all_gens(&mut self) {
+        fn bump(ls: &mut [Layer]) {
+            for l in ls.iter_mut() {
+                l.gen += 1;
+                if let LayerKind::Group { children } = &mut l.kind {
+                    bump(children);
+                }
+            }
+        }
+        bump(&mut self.layers);
+    }
+
     pub fn layer(&self, id: u64) -> Option<&Layer> {
         self.layers.iter().find(|l| l.id == id)
     }

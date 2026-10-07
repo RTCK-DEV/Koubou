@@ -43,8 +43,9 @@ produce an actionable error, never a panic.
 All engine and document operations are dispatch ids (`docs/control-protocol.md`).
 UI, CLI, control channel and MCP all go through `Session::dispatch`. When
 you add a capability, expose it as a command id + params, add it to
-`command_ids`, the CLI tool schemas (`mcp_tools`), and `docs/parity.md`'s
-`cmd:` citations — not just to a Swift view.
+`command_ids` **and** `command_specs` (the single registry the MCP
+`tools/list` is generated from — a test asserts the two stay in sync), and
+`docs/parity.md`'s `cmd:` citations — not just to a Swift view.
 
 ## The layer-id protocol quirk
 

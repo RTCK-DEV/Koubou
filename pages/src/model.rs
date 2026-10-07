@@ -69,6 +69,29 @@ impl PagesDoc {
         Ok(self.pages.remove(idx))
     }
 
+    /// clone a page with fresh frame ids, inserted right after it
+    pub fn duplicate_page(&mut self, idx: usize) -> Result<usize> {
+        if idx >= self.pages.len() {
+            anyhow::bail!("page {idx} out of range ({} pages)", self.pages.len());
+        }
+        let mut p = self.pages[idx].clone();
+        for f in p.frames.iter_mut() {
+            f.id = self.next_id;
+            self.next_id += 1;
+        }
+        self.pages.insert(idx + 1, p);
+        Ok(idx + 1)
+    }
+
+    /// move a frame onto a different page (or master) by global frame id
+    pub fn move_frame(&mut self, id: u64, target: FrameTarget) -> Result<()> {
+        let f = self
+            .remove_frame(id)
+            .with_context(|| format!("frame {id} not found"))?;
+        self.frames_mut(target)?.push(f);
+        Ok(())
+    }
+
     pub fn add_master(&mut self, name: impl Into<String>) -> usize {
         self.masters.push(MasterPage {
             name: name.into(),
@@ -180,7 +203,8 @@ impl PagesDoc {
 }
 
 /// which container a frame belongs to
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum FrameTarget {
     Page(usize),
     Master(usize),

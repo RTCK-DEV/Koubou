@@ -11,7 +11,7 @@ use koubou_core::decode::Decoded;
 use koubou_core::develop::{self, RgbaImage};
 use koubou_core::{Engine, Recipe, WbMode};
 
-use crate::blend::blend_pixel;
+use crate::blend::{blend_pixel, BlendMode};
 use crate::doc::{Document, Fill, Layer, LayerKind, Mask};
 
 /// a rasterized layer in its own pixel space (straight alpha, sRGB)
@@ -47,17 +47,55 @@ impl LayerPixels {
     }
 
     fn to_rgba16(&self) -> Vec<u16> {
-        self.data
-            .iter()
-            .flat_map(|p| {
-                [
-                    (p[0].clamp(0.0, 1.0) * 65535.0).round() as u16,
-                    (p[1].clamp(0.0, 1.0) * 65535.0).round() as u16,
-                    (p[2].clamp(0.0, 1.0) * 65535.0).round() as u16,
-                    (p[3].clamp(0.0, 1.0) * 65535.0).round() as u16,
-                ]
-            })
-            .collect()
+        let mut out = Vec::with_capacity(self.data.len() * 4);
+        out.extend(self.data.iter().flat_map(|p| {
+            [
+                (p[0].clamp(0.0, 1.0) * 65535.0).round() as u16,
+                (p[1].clamp(0.0, 1.0) * 65535.0).round() as u16,
+                (p[2].clamp(0.0, 1.0) * 65535.0).round() as u16,
+                (p[3].clamp(0.0, 1.0) * 65535.0).round() as u16,
+            ]
+        }));
+        out
+    }
+
+    fn to_rgba8(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.data.len() * 4);
+        out.extend(self.data.iter().flat_map(|p| {
+            [
+                (p[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (p[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (p[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+                (p[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]
+        }));
+        out
+    }
+
+    /// bounding box of pixels with alpha > 0, None when fully transparent
+    fn opaque_bbox(&self) -> Option<(u32, u32, u32, u32)> {
+        let (mut x0, mut y0, mut x1, mut y1) = (self.w, self.h, 0u32, 0u32);
+        for y in 0..self.h {
+            for x in 0..self.w {
+                if self.data[(y * self.w + x) as usize][3] > 0.0 {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x + 1);
+                    y1 = y1.max(y + 1);
+                }
+            }
+        }
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
+    }
+
+    /// crop to a pixel-space rect
+    fn crop(&self, x0: u32, y0: u32, w: u32, h: u32) -> LayerPixels {
+        let mut data = Vec::with_capacity((w * h) as usize);
+        for y in y0..y0 + h {
+            let row = (y * self.w + x0) as usize;
+            data.extend_from_slice(&self.data[row..row + w as usize]);
+        }
+        LayerPixels { w, h, data }
     }
 }
 
@@ -82,8 +120,12 @@ impl Composer {
         let w = self.doc.width;
         let h = self.doc.height;
         let mut canvas = LayerPixels::empty(w, h);
-        let layers = self.doc.layers.clone();
-        self.composite_list(&mut canvas, &layers)?;
+        // move the layer vec out rather than cloning it — embedded rasters
+        // and masks are heavy and this list gets walked every render
+        let layers = std::mem::take(&mut self.doc.layers);
+        let r = self.composite_list(&mut canvas, &layers);
+        self.doc.layers = layers;
+        r?;
         // backdrop under everything
         let bd = self.doc.backdrop;
         for p in canvas.data.iter_mut() {
@@ -98,19 +140,62 @@ impl Composer {
         Ok(RgbaImage {
             width: w,
             height: h,
-            data: canvas
-                .data
-                .iter()
-                .flat_map(|p| {
-                    [
-                        (p[0].clamp(0.0, 1.0) * 255.0).round() as u8,
-                        (p[1].clamp(0.0, 1.0) * 255.0).round() as u8,
-                        (p[2].clamp(0.0, 1.0) * 255.0).round() as u8,
-                        (p[3].clamp(0.0, 1.0) * 255.0).round() as u8,
-                    ]
-                })
-                .collect(),
+            data: canvas.to_rgba8(),
         })
+    }
+
+    /// rasterize one layer's own pixels (no blending) — for layer export
+    pub fn render_layer(&mut self, id: u64) -> Result<RgbaImage> {
+        let layer = self.doc.layer(id).context("layer not found")?.clone();
+        let pix = self.rasterize_layer(&layer)?;
+        Ok(RgbaImage {
+            width: pix.w,
+            height: pix.h,
+            data: pix.to_rgba8(),
+        })
+    }
+
+    /// merge `id` with the layer below it into one raster layer; the new
+    /// layer keeps the lower layer's name and takes both layers' place.
+    /// Returns the merged layer's id.
+    pub fn merge_down(&mut self, id: u64) -> Result<u64> {
+        let i = self
+            .doc
+            .index_of(id)
+            .with_context(|| format!("layer {id} not found"))?;
+        if i == 0 {
+            anyhow::bail!("layer {id} is the bottom layer — nothing to merge into");
+        }
+        let below_name = self.doc.layers[i - 1].name.clone();
+        let pair = self.doc.layers[i - 1..=i].to_vec();
+        let mut buf = LayerPixels::empty(self.doc.width, self.doc.height);
+        self.composite_list(&mut buf, &pair)?;
+        let (pix, x, y) = match buf.opaque_bbox() {
+            Some((x0, y0, x1, y1)) => (buf.crop(x0, y0, x1 - x0, y1 - y0), x0 as i32, y0 as i32),
+            None => (buf.crop(0, 0, 1, 1), 0, 0),
+        };
+        let mut merged = Layer::raster(below_name, pix.w, pix.h, pix.to_rgba8());
+        merged.x = x;
+        merged.y = y;
+        merged.visible = true;
+        merged.opacity = 1.0;
+        merged.blend = BlendMode::Normal;
+        self.doc.layers.remove(i);
+        self.doc.layers.remove(i - 1);
+        let new_id = self.doc.add_layer_at(merged, i - 1);
+        Ok(new_id)
+    }
+
+    /// bake the whole composite into a single raster layer named `name`
+    pub fn flatten(&mut self, name: &str) -> Result<u64> {
+        let img = self.render()?;
+        let mut l = Layer::raster(name, img.width, img.height, img.data);
+        l.id = self.doc.next_id;
+        self.doc.next_id += 1;
+        let id = l.id;
+        self.doc.layers = vec![l];
+        self.cache.clear();
+        Ok(id)
     }
 
     /// render then fit inside max_px (for previews)
@@ -238,6 +323,9 @@ impl Composer {
 
     /// blend a layer's pixels onto the canvas honouring offset/scale/mask/opacity
     fn blend_layer(&self, canvas: &mut LayerPixels, pix: &LayerPixels, layer: &Layer) {
+        if layer.opacity <= 0.0 {
+            return;
+        }
         let scale = layer.scale.max(1e-4);
         let dw = (pix.w as f32 * scale).ceil() as i64;
         let dh = (pix.h as f32 * scale).ceil() as i64;
@@ -252,6 +340,38 @@ impl Composer {
             .filter(|m| m.feather > 0.0)
             .map(|m| blur_mask(m));
         let mask = feathered.as_ref().or(layer.mask.as_ref());
+        // 1:1 placement is the dominant case (photo layers) — integer-index
+        // sampling skips the four-tap bilinear entirely. Same result: at
+        // integral coords bilinear returns the pixel itself.
+        if scale == 1.0 {
+            let opacity = layer.opacity.clamp(0.0, 1.0);
+            for dy in y0.max(0)..(y0 + dh).min(ch) {
+                let sy = (dy - y0) as u32;
+                if sy >= pix.h {
+                    continue;
+                }
+                for dx in x0.max(0)..(x0 + dw).min(cw) {
+                    let sx = (dx - x0) as u32;
+                    if sx >= pix.w {
+                        continue;
+                    }
+                    let p = pix.data[(sy * pix.w + sx) as usize];
+                    if p[3] <= 0.0 {
+                        continue;
+                    }
+                    let mut a = p[3] * opacity;
+                    if let Some(m) = mask {
+                        a *= mask_at(m, sx as f32, sy as f32);
+                    }
+                    if a <= 0.0 {
+                        continue;
+                    }
+                    let i = (dy as u32 * canvas.w + dx as u32) as usize;
+                    blend_pixel(&mut canvas.data[i], [p[0], p[1], p[2], a], layer.blend);
+                }
+            }
+            return;
+        }
         for dy in y0.max(0)..(y0 + dh).min(ch) {
             for dx in x0.max(0)..(x0 + dw).min(cw) {
                 // bilinear sample in layer space (pixel centers on integers)
@@ -363,11 +483,7 @@ fn blur_mask(m: &Mask) -> Mask {
 fn rasterize_fill(fill: &Fill, w: u32, h: u32) -> LayerPixels {
     let mut p = LayerPixels::empty(w, h);
     match fill {
-        Fill::Solid { color } => {
-            for px in p.data.iter_mut() {
-                *px = *color;
-            }
-        }
+        Fill::Solid { color } => p.data.fill(*color),
         Fill::LinearGradient { line, stops } => {
             if stops.is_empty() {
                 return p;

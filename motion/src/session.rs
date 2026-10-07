@@ -43,10 +43,16 @@ impl TlSession {
             "tl.save",
             "tl.json",
             "tl.addTrack",
+            "tl.setTrack",
+            "tl.removeTrack",
             "tl.addClip",
             "tl.setClip",
             "tl.removeClip",
+            "tl.splitClip",
+            "tl.duplicateClip",
             "tl.addCue",
+            "tl.setCue",
+            "tl.removeCue",
             "tl.probe",
             "tl.renderFrame",
             "tl.render",
@@ -168,6 +174,73 @@ impl TlSession {
                 };
                 let track = v.get("track").and_then(Value::as_u64).map(|i| i as usize);
                 self.tl()?.add_cue(track, cue)?;
+                Ok(json!("ok"))
+            }
+            "tl.setTrack" => {
+                let idx = req_u64(v, "track")? as usize;
+                let t = self.tl()?;
+                let tr = t
+                    .tracks
+                    .get_mut(idx)
+                    .with_context(|| format!("track index {idx} out of range"))?;
+                if let Some(n) = v.get("name").and_then(Value::as_str) {
+                    tr.name = n.to_string();
+                }
+                if let Some(m) = v.get("muted").and_then(Value::as_bool) {
+                    tr.muted = m;
+                }
+                Ok(json!("ok"))
+            }
+            "tl.removeTrack" => {
+                let idx = req_u64(v, "track")? as usize;
+                let t = self.tl()?;
+                if idx >= t.tracks.len() {
+                    anyhow::bail!("track index {idx} out of range");
+                }
+                t.tracks.remove(idx);
+                Ok(json!("ok"))
+            }
+            "tl.splitClip" => {
+                let id = req_u64(v, "clip")?;
+                let t_sec = req_f64(v, "t")?;
+                let new_id = self.tl()?.split_clip(id, t_sec)?;
+                Ok(json!({"clipId": new_id}))
+            }
+            "tl.duplicateClip" => {
+                let id = req_u64(v, "clip")?;
+                let new_id = self.tl()?.duplicate_clip(id)?;
+                Ok(json!({"clipId": new_id}))
+            }
+            "tl.setCue" => {
+                let idx = req_u64(v, "index")? as usize;
+                let track = v.get("track").and_then(Value::as_u64).map(|i| i as usize);
+                let t = self.tl()?;
+                let cues = cue_list_mut(t, track)?;
+                let cue = cues
+                    .get_mut(idx)
+                    .with_context(|| format!("cue index {idx} out of range"))?;
+                if let Some(x) = v.get("t").and_then(Value::as_f64) {
+                    cue.t = x;
+                }
+                if let Some(x) = v.get("dur").and_then(Value::as_f64) {
+                    cue.dur = x;
+                }
+                if let Some(x) = v.get("text").and_then(Value::as_str) {
+                    cue.text = x.to_string();
+                }
+                cue.sanitize();
+                cues.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap_or(std::cmp::Ordering::Equal));
+                Ok(json!("ok"))
+            }
+            "tl.removeCue" => {
+                let idx = req_u64(v, "index")? as usize;
+                let track = v.get("track").and_then(Value::as_u64).map(|i| i as usize);
+                let t = self.tl()?;
+                let cues = cue_list_mut(t, track)?;
+                if idx >= cues.len() {
+                    anyhow::bail!("cue index {idx} out of range");
+                }
+                cues.remove(idx);
                 Ok(json!("ok"))
             }
             "tl.probe" => {
@@ -393,6 +466,68 @@ fn curl_json(url: &str, args: &[String], timeout_secs: u64) -> Result<Value> {
     })
 }
 
+/// pick the cue list of a subtitle track — `track` as an index, or the
+/// first subtitle track when absent (mirrors `Timeline::add_cue`).
+fn cue_list_mut<'a>(t: &'a mut Timeline, track: Option<usize>) -> Result<&'a mut Vec<Cue>> {
+    let idx = match track {
+        Some(i) => {
+            let tr = t
+                .tracks
+                .get(i)
+                .with_context(|| format!("track index {i} out of range"))?;
+            if tr.kind != TrackKind::Subtitle {
+                anyhow::bail!("track {i} is {:?}, not a subtitle track", tr.kind);
+            }
+            i
+        }
+        None => t
+            .tracks
+            .iter()
+            .position(|tr| tr.kind == TrackKind::Subtitle)
+            .context("no subtitle track — add one with tl.addTrack kind=subtitle")?,
+    };
+    Ok(&mut t.tracks[idx].cues)
+}
+
+/// MCP-shaped tool specs ({id, name, description, inputSchema}) for every
+/// tl.* command — the single source of truth the Session registry and the
+/// MCP server both read.
+pub fn command_specs() -> Vec<Value> {
+    let spec = |id: &str, desc: &str, props: Value, required: &[&str]| {
+        json!({
+            "id": id,
+            "name": id.replace('.', "_"),
+            "description": desc,
+            "inputSchema": {"type": "object", "properties": props, "required": required},
+        })
+    };
+    let s = |d: &str| json!({"type": "string", "description": d});
+    let n = |d: &str| json!({"type": "number", "description": d});
+    let b = |d: &str| json!({"type": "boolean", "description": d});
+    vec![
+        spec("tl.new", "Create a new video timeline", json!({"w": n("px"), "h": n("px"), "fps": n("frames/sec"), "name": s("name")}), &[]),
+        spec("tl.open", "Open a .kmotion timeline", json!({"path": s("timeline path")}), &["path"]),
+        spec("tl.save", "Save the timeline as .kmotion", json!({"path": s("path; default <name>.kmotion")}), &[]),
+        spec("tl.json", "Return the timeline's JSON state (includes computed duration)", json!({}), &[]),
+        spec("tl.addTrack", "Add a track (kind: video|audio|subtitle)", json!({"kind": s("track kind"), "name": s("name"), "muted": b("muted")}), &["kind"]),
+        spec("tl.setTrack", "Edit a track (name, muted)", json!({"track": n("track index"), "name": s("name"), "muted": b("muted")}), &["track"]),
+        spec("tl.removeTrack", "Remove a track and everything on it", json!({"track": n("track index")}), &["track"]),
+        spec("tl.addClip", "Add a clip to a track — media via 'src' (needs 'out'), text via 'text' (optional 'dur')", json!({"track": n("track index"), "src": s("media path"), "text": s("text clip content"), "in": n("source in sec"), "out": n("source out sec"), "dur": n("text clip seconds"), "offset": n("timeline offset sec")}), &["track"]),
+        spec("tl.setClip", "Edit a clip (in/out/offset/opacity/scale/x/y/fadeIn/fadeOut — scalars or keyframe [[t,v]] lists)", json!({"clip": n("clip id")}), &["clip"]),
+        spec("tl.removeClip", "Remove a clip", json!({"clip": n("clip id")}), &["clip"]),
+        spec("tl.splitClip", "Split a clip at timeline second t into two clips", json!({"clip": n("clip id"), "t": n("timeline sec")}), &["clip", "t"]),
+        spec("tl.duplicateClip", "Clone a clip onto its track right after the original", json!({"clip": n("clip id")}), &["clip"]),
+        spec("tl.addCue", "Append a subtitle cue (track: subtitle track index; default = first)", json!({"t": n("sec"), "dur": n("sec"), "text": s("cue text"), "track": n("subtitle track index")}), &["t", "dur", "text"]),
+        spec("tl.setCue", "Edit a cue by index (t/dur/text; same 'track' rule as tl.addCue)", json!({"index": n("cue index"), "track": n("subtitle track index")}), &["index"]),
+        spec("tl.removeCue", "Remove a cue by index", json!({"index": n("cue index"), "track": n("subtitle track index")}), &["index"]),
+        spec("tl.probe", "ffprobe a media file (duration/fps/streams)", json!({"path": s("media path")}), &["path"]),
+        spec("tl.renderFrame", "Render one frame at t seconds (PNG to 'out', else pngB64 inline)", json!({"t": n("sec"), "out": s("output path")}), &["t"]),
+        spec("tl.render", "Render the timeline to mp4 via ffmpeg", json!({"out": s("output path"), "burnSubs": b("burn subtitle cues")}), &["out"]),
+        spec("tl.detectSilence", "ffmpeg silencedetect on a media file → [{start,end}]", json!({"path": s("media path"), "thresholdDB": n("dB, default -35"), "minDur": n("sec, default 0.5")}), &["path"]),
+        spec("tl.generateClip", "Generate a clip with a minimax-h3 h3ui-style backend and add it", json!({"endpoint": s("backend base URL, default http://127.0.0.1:8000"), "prompt": s("generation prompt"), "track": n("track index")}), &["prompt"]),
+    ]
+}
+
 fn req_str(v: &Value, k: &str) -> Result<String> {
     v.get(k)
         .and_then(Value::as_str)
@@ -496,10 +631,16 @@ mod tests {
             "tl.save",
             "tl.json",
             "tl.addTrack",
+            "tl.setTrack",
+            "tl.removeTrack",
             "tl.addClip",
             "tl.setClip",
             "tl.removeClip",
+            "tl.splitClip",
+            "tl.duplicateClip",
             "tl.addCue",
+            "tl.setCue",
+            "tl.removeCue",
             "tl.probe",
             "tl.renderFrame",
             "tl.render",
@@ -508,7 +649,7 @@ mod tests {
         ] {
             assert!(ids.contains(&c), "missing {c}");
         }
-        assert_eq!(ids.len(), 14);
+        assert_eq!(ids.len(), 20);
     }
 
     #[test]

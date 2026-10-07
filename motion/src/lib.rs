@@ -14,4 +14,4 @@ pub mod session;
 pub mod text;
 
 pub use model::{eval_kf, kf_expr, Clip, Cue, Timeline, Track, TrackKind};
-pub use session::TlSession;
+pub use session::{command_specs, TlSession};

@@ -49,10 +49,10 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 
 | feature | status | command / note |
 |---|---|---|
-| Layer stack (add/remove/reorder/select) | ✅ | `cmd:doc.addLayer`, `doc.removeLayer`, `doc.reorder`, `doc.setLayer` |
+| Layer stack (add/remove/reorder/select/duplicate) | ✅ | `cmd:doc.addLayer`, `doc.removeLayer`, `doc.reorder`, `doc.setLayer`, `doc.duplicateLayer` |
 | Opacity + visibility | ✅ | `doc.setLayer` |
 | Blend modes — 27 per PDF/W3C | ✅ | `BlendMode`; `Dissolve` falls back to normal (🟡) |
-| Layer masks (paint, density, feather, invert) | ✅ | `cmd:doc.maskPaint` + `Layer.mask` |
+| Layer masks (paint, density, feather, invert) | ✅ | `cmd:doc.maskPaint`, `doc.maskInvert` + `Layer.mask` |
 | Develop layers (live RAW develop inside stack) | ✅ | `doc.addLayer kind=develop` |
 | Adjustment layers (full recipe over the stack below) | ✅ | `doc.addLayer kind=adjustment` |
 | Fill layers (solid/linear gradient) | ✅ | `doc.addLayer kind=fill/gradient` |
@@ -62,13 +62,14 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | Group layers (isolated composite) | 🟡 | engine ✅; UI nesting ❌ |
 | Raster layers (embedded PNG / file link) | ✅ | `doc.addLayer kind=raster/rasterFile` |
 | Document model (.koubou JSON), open/save | ✅ | `doc.new`, `doc.open`, `doc.save`, `doc.json`, `doc.fromPhoto` |
-| Full-res export + preview render | ✅ | `doc.render` (PNG only — JPEG/TIFF ❌) |
+| Full-res export + preview render | ✅ | `doc.render` (PNG only — JPEG/TIFF ❌), `doc.exportLayer` |
 | PSD import (layers, blend modes, masks→flattened) | ✅ | `doc.importPsd` / `koubou-cli psd` |
 | PSD export | ❌ | — |
 | Canvas: pan/zoom | 🟡 | fit-to-view only |
 | Canvas: drag-move, transform handles, marquee | ❌ | numeric x/y/scale via inspector |
 | On-canvas text editing | ❌ | inspector text field only |
-| Undo/redo (documents) | ❌ | — |
+| Undo/redo (all domains, ⌘Z in-app) | ✅ | `cmd:doc.undo`, `doc.redo`, `tl.undo`, `tl.redo`, `pg.undo`, `pg.redo` — snapshot stacks, cap 32 |
+| Merge down / flatten / canvas resize+crop | ✅ | `doc.mergeDown`, `doc.flatten`, `doc.resize`, `doc.crop`, `doc.setBackdrop` |
 | Layer styles (shadow, glow, stroke, bevel) | ❌ | — |
 | Smart objects / linked docs | ❌ | — |
 | Channels palette, alpha ops | ❌ | — |
@@ -83,16 +84,16 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 |---|---|---|
 | JSON command dispatch (all ops by id) | ✅ | `composer::commands::Session` |
 | TCP control channel + stdio | ✅ | `koubou-cli control [--port N]` |
-| MCP server (tools/list, tools/call) | ✅ | `koubou-cli mcp` |
+| MCP server (generated tools, resources, structuredContent) | ✅ | `koubou-cli mcp` — tools/list from `Session::command_specs()`; `koubou://doc|timeline|pages|commands` resources |
 | macOS FFI (engine + doc dispatch) | ✅ | `araware_*` (engine), `kou_*` (docs) exports |
-| Undo-safe command log (for scripted sessions) | 🟡 | commands are idempotent-ish; no formal journal |
+| Atomic multi-command batch | ✅ | `cmd:batch` — rollback restores doc state + history stacks |
+| Undo-safe command log (for scripted sessions) | 🟡 | undo stacks exist; no persisted journal |
 | Headless UI snapshot (app-level) | ❌ | render verification via `doc.render` instead |
 
 ## Top gaps (ordered by user impact)
 
-1. Doc undo/redo — losing edits is the #1 trust gap
-2. Canvas manipulation (drag-move, on-canvas text, marquee)
-3. Inspector coverage for the full recipe (curves/wheels/qualifier)
+1. Canvas manipulation (drag-move, on-canvas text, marquee)
+2. Inspector coverage for the full recipe (curves/wheels/qualifier)
 4. JPEG/TIFF export from documents
 5. Mask UX (thumbnail, gradient tool, mask view)
 6. Group nesting in the UI
@@ -112,8 +113,9 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | feature | status | command / note |
 |---|---|---|
 | Timeline model (.kmotion): tracks, clips, cues | ✅ | `cmd:tl.new`, `tl.open`, `tl.save`, `tl.json`, `tl.addTrack` |
-| Clip edit (in/out/offset, keyframed opacity/scale/x/y, fades) | ✅ | `tl.addClip`, `tl.setClip`, `tl.removeClip` |
-| Subtitles (cues) + SRT burn-in | ✅ | `tl.addCue` |
+| Clip edit (in/out/offset, keyframed opacity/scale/x/y, fades) | ✅ | `tl.addClip`, `tl.setClip`, `tl.removeClip`, `tl.splitClip`, `tl.duplicateClip` |
+| Track edit (name/mute/remove) | ✅ | `tl.setTrack`, `tl.removeTrack` |
+| Subtitles (cues) + SRT burn-in | ✅ | `tl.addCue`, `tl.setCue`, `tl.removeCue` |
 | Frame preview + mp4 export via ffmpeg | ✅ | `tl.renderFrame`, `tl.render` |
 | Silence detection, media probe | ✅ | `tl.detectSilence`, `tl.probe` |
 | Generative clip insert (minimax-h3 endpoint) | ✅ | `tl.generateClip` |
@@ -126,8 +128,8 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 
 | feature | status | command / note |
 |---|---|---|
-| Multi-page doc (.kpages), masters | ✅ | `cmd:pg.new`, `pg.open`, `pg.save`, `pg.addPage`, `pg.setMaster` |
-| Frames: text/image/rect/line, rotation | ✅ | `pg.addFrame`, `pg.setFrame`, `pg.removeFrame` |
+| Multi-page doc (.kpages), masters | ✅ | `cmd:pg.new`, `pg.open`, `pg.save`, `pg.addPage`, `pg.duplicatePage`, `pg.addMaster`, `pg.setMaster` |
+| Frames: text/image/rect/line, rotation, move across pages | ✅ | `pg.addFrame`, `pg.setFrame`, `pg.removeFrame`, `pg.moveFrame` |
 | PDF export (PDF 1.4, Helvetica+JPEG+vectors) | ✅ | `pg.render` |
 | Page PNG preview | ✅ | `pg.renderPng` |
 | Text flow/threading, facing pages, bleed | ❌ | — |

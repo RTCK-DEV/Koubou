@@ -30,8 +30,9 @@ polish isn't:
 - 🟡 Adjustment layers run the full develop recipe — but the doc editor UI
   only exposes a slider subset (curves/wheels/qualifier editable via
   commands, not yet the app's inspector)
-- 🟡 No undo/redo in the doc editor yet (session store + doc.json diffing
-  planned); the single-photo editor has recipe undo already
+- ✅ Undo/redo everywhere: per-domain snapshot stacks (cap 32) behind
+  `doc.undo`/`tl.undo`/`pg.undo` (+`.redo`), wired to ⌘Z/⇧⌘Z in the app's
+  Edit menu; `batch` runs atomic multi-command transactions
 - 🟡 Canvas is view+paint only: no drag-move, no marquee/lasso, no on-canvas
   text editing — placement is numeric (x/y/scale) for now
 - ❌ No PSD *export*, smart objects, layer styles (drop shadow/stroke),
@@ -52,22 +53,24 @@ polish isn't:
   PDF 1.4 writer — designcraft's core; PDF *import* (PDFKit → layers)
   covers printcraft's read path
 - ✅ Vector: parametric shape generators + dashed strokes on shape layers
-- 🟡 Behind on plumbing maturity: they have undo stacks, menus, shortcut
-  maps and a full xtask CI harness; Koubou has the command core and the
-  tracker, not yet the polish
+- 🟡 Plumbing is catching up: per-domain undo stacks + Edit-menu ⌘Z are
+  in, and every command now carries a generated MCP tool spec (single
+  registry, no schema drift) + atomic `batch`; still no persisted command
+  journal or xtask-style CI harness
 - ❌ No transitions beyond fades, no audio ducking UI, no path boolean
   ops, no PDF annotation/preflight — the deep ends of each domain
 
 ## Where we're going (ordered)
 
-1. **Undo/redo for documents** — command-level snapshot history in the
-   session (bounded by memory), exposed as `doc.undo`/`doc.redo`
-2. **Timeline depth** — transitions (wipe/dip), audio ducking/EQ UI,
+1. **Timeline depth** — transitions (wipe/dip), audio ducking/EQ UI,
    ripple editing, speed ramps
-3. **Canvas manipulation** — drag-move layers/clips, marquee select,
+2. **Canvas manipulation** — drag-move layers/clips, marquee select,
    on-canvas text edit, transform handles
-4. **Doc inspector parity** — curves, wheels, qualifier and power windows
+3. **Doc inspector parity** — curves, wheels, qualifier and power windows
    in the layer inspector (the recipe engine already does all of it)
+4. **Compositor hot paths** — 1:1 fast path and copy elimination are in;
+   next is a dirty-rect/incremental composite so single-layer edits don't
+   re-blend the whole stack
 5. **Mask UX** — mask thumbnail, gradient/brush tools, mask-from-qualifier
 6. **Pages depth** — text flow between frames, facing pages, styles
 7. **Export breadth** — JPEG/TIFF/WebP export with size/quality options;
