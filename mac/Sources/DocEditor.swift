@@ -299,15 +299,17 @@ final class DocStore: ObservableObject {
         dirty = false
     }
 
-    /// Export the composite. format: png|jpeg|tiff|psd
+    /// Export the composite. format: png|jpeg|tiff|psd|psdflat
     func exportAs(_ format: String) {
         let p = NSSavePanel()
-        let ext = format == "jpeg" ? "jpg" : format
+        let ext = format == "jpeg" ? "jpg" :
+                  format.hasPrefix("psd") ? "psd" : format
         if let t = UTType(filenameExtension: ext) { p.allowedContentTypes = [t] }
         p.nameFieldStringValue = (docName.isEmpty ? "Untitled" : docName) + "." + ext
         guard p.runModal() == .OK, let url = p.url else { return }
-        if format == "psd" {
-            dispatch(["id": "doc.exportPsd", "path": url.path], then: .none)
+        if format.hasPrefix("psd") {
+            dispatch(["id": "doc.exportPsd", "path": url.path,
+                      "flat": format == "psdflat"], then: .none)
         } else {
             dispatch(["id": "doc.render", "out": url.path,
                       "format": format, "quality": 92], then: .none)
@@ -896,7 +898,8 @@ struct DocEditorView: View {
                 Button("PNG…") { doc.exportAs("png") }
                 Button("JPEG…") { doc.exportAs("jpeg") }
                 Button("TIFF…") { doc.exportAs("tiff") }
-                Button("PSD (flat)…") { doc.exportAs("psd") }
+                Button("PSD (layered)…") { doc.exportAs("psd") }
+                Button("PSD (flat)…") { doc.exportAs("psdflat") }
             } label: {
                 Text("Export")
                     .font(.system(size: 11, weight: .semibold))
