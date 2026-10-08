@@ -153,12 +153,12 @@ fn collect_stack(c: &mut Composer, stack: &[Layer], recs: &mut Vec<Rec>) -> Resu
     for (i, layer) in stack.iter().enumerate() {
         match &layer.kind {
             LayerKind::Group { children } => {
-                // a normal group is a pass-through container in PSD terms
-                let key = if layer.blend == BlendMode::Normal {
-                    *b"pass"
-                } else {
-                    psd_key(layer.blend)
-                };
+                // koubou composites groups in ISOLATION (children blend
+                // against an empty buffer, result blends down). `pass`
+                // would tell Photoshop to blend children straight into
+                // the backdrop — different image. The faithful key is
+                // the group's own blend (norm = isolated composite).
+                let key = psd_key(layer.blend);
                 let opacity_u8 = (layer.opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
                 let hidden = !layer.visible;
                 // Bounding record: placeholder in real PSDs — but the `psd`
@@ -246,10 +246,7 @@ fn push_pixel(recs: &mut Vec<Rec>, layer: &Layer, pix: &LayerPixels) {
         }
         out
     };
-    let mask = layer
-        .mask
-        .as_ref()
-        .map(|m| export_mask(m, scale, layer.x, layer.y));
+    let mask = layer.mask.as_ref().map(export_mask);
     recs.push(Rec::Pixel(PixelRec {
         name: layer.name.clone(),
         id: layer.id,
@@ -265,9 +262,12 @@ fn push_pixel(recs: &mut Vec<Rec>, layer: &Layer, pix: &LayerPixels) {
     }));
 }
 
-/// bake feather + invert + density into u8 coverage, resampled to the
-/// layer's placed scale (mask lives at layer.x/y, same space as pixels)
-fn export_mask(m: &Mask, scale: f32, x: i32, y: i32) -> MaskRec {
+/// bake feather + invert + density into u8 coverage. The mask bitmap
+/// is document-space (mask_at is sampled at doc coords, independent of
+/// layer x/y/scale) so the record is anchored at the doc origin and the
+/// rect equals the buffer — never offset it by the layer position or a
+/// strict reader will double-offset it.
+fn export_mask(m: &Mask) -> MaskRec {
     let blurred;
     let m = if m.feather > 0.0 {
         blurred = blur_mask(m);
@@ -275,20 +275,19 @@ fn export_mask(m: &Mask, scale: f32, x: i32, y: i32) -> MaskRec {
     } else {
         m
     };
-    let w = ((m.width as f32 * scale).ceil() as u32).max(1);
-    let h = ((m.height as f32 * scale).ceil() as u32).max(1);
+    let (w, h) = (m.width, m.height);
     let mut gray = vec![0u8; (w * h) as usize];
     for gy in 0..h {
         for gx in 0..w {
             // mask_at() applies floor sampling + invert + density — the
             // same effective coverage the compositor uses
-            let v = mask_at(m, gx as f32 / scale, gy as f32 / scale);
+            let v = mask_at(m, gx as f32, gy as f32);
             gray[(gy * w + gx) as usize] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
         }
     }
     MaskRec {
-        top: y,
-        left: x,
+        top: 0,
+        left: 0,
         w,
         h,
         gray,
@@ -493,7 +492,7 @@ fn extra_data(rec: &Rec, doc_channels: u32) -> Vec<u8> {
         be32i(&mut e, m.top.saturating_add(m.h as i32));
         be32i(&mut e, m.left.saturating_add(m.w as i32));
         e.push(0); // defaultColor — black shows through as partial mask
-        e.push(1); // flags: bit0 = mask position relative to layer
+        e.push(0); // flags: 0 = rect is absolute document coordinates
         e.extend_from_slice(&[0u8; 2]);
     } else {
         be32(&mut e, 0);

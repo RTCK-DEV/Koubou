@@ -64,7 +64,7 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | Document model (.koubou JSON), open/save | ✅ | `doc.new`, `doc.open`, `doc.save`, `doc.json`, `doc.fromPhoto` |
 | Full-res export + preview render | ✅ | `cmd:doc.render` (PNG/JPEG/TIFF, `format`+`quality` params), `doc.exportLayer` |
 | PSD import (layers, blend modes, masks→flattened) | ✅ | `doc.importPsd` / `koubou-cli psd` |
-| PSD export | ✅ | `cmd:doc.exportPsd` — layered writer: names/stack/offsets/visibility/opacity/27 blend keys, groups as section-divider+folder records, masks as user-mask channels; adjustment layers baked against the composite below, `scale` baked into pixels; `flat:true` for merged-only |
+| PSD export | ✅ | `cmd:doc.exportPsd` — layered writer: names/stack/offsets/visibility/opacity/27 blend keys, groups as section-divider+folder records, masks as user-mask channels (doc-space coverage); groups written with their real blend key (koubou composites groups isolated — `norm`, never `pass`); adjustment layers baked against the composite below, `scale` baked into pixels; `flat:true` for merged-only |
 | Canvas: pan/zoom | ✅ | scroll-wheel pan, ⌘+scroll zoom about cursor, pinch zoom, spacebar drag-pan, toolbar −/+ and % menu (Fit ⌘0, 50–400%) |
 | Canvas: drag-move, transform handles, marquee | ✅ | `cmd:doc.pick`, `doc.bounds` + canvas gestures (alpha-precise pick, corner scale handles, marquee → selectedSet) |
 | On-canvas text editing | ✅ | double-click a text layer → in-place editor (Esc commits) |

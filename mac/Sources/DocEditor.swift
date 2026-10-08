@@ -896,7 +896,7 @@ struct DocEditorView: View {
                 Button("PNG…") { doc.exportAs("png") }
                 Button("JPEG…") { doc.exportAs("jpeg") }
                 Button("TIFF…") { doc.exportAs("tiff") }
-                Button("PSD (flat)…") { doc.exportAs("psd") }
+                Button("PSD…") { doc.exportAs("psd") }
             } label: {
                 Text("Export")
                     .font(.system(size: 11, weight: .semibold))
