@@ -27,7 +27,7 @@ pub struct LayerPixels {
 }
 
 impl LayerPixels {
-    fn empty(w: u32, h: u32) -> LayerPixels {
+    pub(crate) fn empty(w: u32, h: u32) -> LayerPixels {
         LayerPixels {
             w,
             h,
@@ -63,7 +63,7 @@ impl LayerPixels {
         out
     }
 
-    fn to_rgba8(&self) -> Vec<u8> {
+    pub(crate) fn to_rgba8(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.data.len() * 4);
         out.extend(self.data.iter().flat_map(|p| {
             [
@@ -309,7 +309,11 @@ impl Composer {
         })
     }
 
-    fn composite_list(&mut self, canvas: &mut LayerPixels, layers: &[Layer]) -> Result<()> {
+    pub(crate) fn composite_list(
+        &mut self,
+        canvas: &mut LayerPixels,
+        layers: &[Layer],
+    ) -> Result<()> {
         for layer in layers {
             if !layer.visible {
                 continue;
@@ -757,7 +761,11 @@ impl Composer {
     }
 
     /// the develop pipeline applied to an in-memory composite (raster input)
-    fn develop_adjustment(&self, snapshot: &LayerPixels, recipe: &Recipe) -> Result<LayerPixels> {
+    pub(crate) fn develop_adjustment(
+        &self,
+        snapshot: &LayerPixels,
+        recipe: &Recipe,
+    ) -> Result<LayerPixels> {
         let mut r = sanitize_adjustment(recipe);
         // keep user temp/tint but neutralize WB mode semantics on a raster
         if matches!(r.wb_mode, WbMode::Pick) {
@@ -880,7 +888,7 @@ impl Composer {
     }
 
     /// rasterize a layer's content into layer pixel space (cached)
-    fn rasterize_layer(&mut self, layer: &Layer) -> Result<LayerPixels> {
+    pub(crate) fn rasterize_layer(&mut self, layer: &Layer) -> Result<LayerPixels> {
         if let Some((gen, pix)) = self.cache.get(&layer.id) {
             if *gen == layer.gen {
                 return Ok(pix.clone());
@@ -1005,7 +1013,7 @@ impl Composer {
     }
 }
 
-fn sample_bilinear(pix: &LayerPixels, x: f32, y: f32) -> [f32; 4] {
+pub(crate) fn sample_bilinear(pix: &LayerPixels, x: f32, y: f32) -> [f32; 4] {
     let x0 = x.floor() as i64;
     let y0 = y.floor() as i64;
     let fx = x - x0 as f32;
@@ -1032,7 +1040,7 @@ fn sample_bilinear(pix: &LayerPixels, x: f32, y: f32) -> [f32; 4] {
     out
 }
 
-fn mask_at(m: &Mask, x: f32, y: f32) -> f32 {
+pub(crate) fn mask_at(m: &Mask, x: f32, y: f32) -> f32 {
     let ix = x.floor().max(0.0) as u32;
     let iy = y.floor().max(0.0) as u32;
     m.at(
@@ -1138,7 +1146,7 @@ fn erode(data: &mut [f32], w: u32, h: u32, r: usize) {
 }
 
 /// 3-pass box blur ≈ gaussian for mask feathering
-fn blur_mask(m: &Mask) -> Mask {
+pub(crate) fn blur_mask(m: &Mask) -> Mask {
     let r = m.feather.max(0.0).round() as usize;
     if r == 0 {
         return m.clone();

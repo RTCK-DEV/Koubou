@@ -26,8 +26,8 @@ Two honest ledgers, like the craft-suite docs that inspired this format:
 polish isn't:
 
 - ✅ Layers (raster/develop/adjustment/fill/shape/text/group), masks with
-  feather, 27 blend modes (PDF/W3C), opacity/transform, PSD *import*,
-  flat PSD/JPEG/TIFF/PNG export
+  feather, 27 blend modes (PDF/W3C), opacity/transform, layered PSD
+  import + export, JPEG/TIFF/PNG export
 - ✅ Doc inspector exposes the full recipe: light/wheels/curves/zones/
   qualifier/windows/mixer/detail/fx palettes — same UI as develop
 - ✅ Undo/redo everywhere: per-domain snapshot stacks (cap 32) behind
@@ -47,8 +47,9 @@ polish isn't:
 - ✅ Mask UX improved: Invert chip + brush softness slider in the mask
   panel (`doc.maskInvert`, `softness` on `doc.maskPaint`)
 - ✅ Layer styles: full PS set (shadows, glows, bevel/emboss, satin,
-  color/gradient/pattern overlays, stroke) via `doc.styleSet` + inspector;
-  no layered PSD export (flat only)
+  color/gradient/pattern overlays, stroke) via `doc.styleSet` + inspector
+- ✅ Layered PSD export: layer records, groups, masks, 27 blend keys,
+  visibility/opacity/offsets (`doc.exportPsd`; `flat:true` for merged)
 - ❌ Smart objects, channel ops, filter gallery, liquify, text-on-path
 
 **vs the storytold craft suite** — one app now spans all seven domains:
@@ -85,12 +86,12 @@ polish isn't:
 ## Where we're going (ordered)
 
 1. **Mask UX** — mask thumbnail, gradient/brush tools, mask-from-qualifier
-2. **Layered PSD export** — a real writer that keeps layers, not the
-   current flat composite
-3. **Boolean vector ops + SVG import/export**
-4. **Speed ramps** — constant rate landed (`tl.setClip rate`); ramps
+2. **Boolean vector ops + SVG import/export**
+3. **Speed ramps** — constant rate landed (`tl.setClip rate`); ramps
    = split + per-clip rate until keyframed rate exists
-5. **Real playback in Motion** — GPU realtime instead of frame stepping
+4. **Real playback in Motion** — GPU realtime instead of frame stepping
+5. **PSD depth** — styles as native PSD effects, clipping masks, smart
+   objects (layered export keeps pixels + metadata, not editability)
 6. **Gradient editor for layer styles** — stops UI; params only today
 7. **xtask CI** — fmt/clippy/layers/parity in one command (today:
    `scripts/parity_check.sh` + `cargo test --workspace`)
