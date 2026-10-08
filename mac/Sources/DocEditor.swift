@@ -27,6 +27,7 @@ final class CanvasOverlayNSView: NSView {
     var onScroll: ((CGPoint, CGSize, NSEvent.ModifierFlags, CGSize) -> Void)?
     /// spacebar held state for pan mode (keyCode 49)
     var onSpace: ((Bool) -> Void)?
+    var onEscape: (() -> Void)?
     private static let accent =
         NSColor(srgbRed: 1.0, green: 0.62, blue: 0.13, alpha: 1)
 
@@ -54,9 +55,12 @@ final class CanvasOverlayNSView: NSView {
             if let m = NSEvent.addLocalMonitorForEvents(
                 matching: mask,
                 handler: { [weak self] ev in
-                    if ev.keyCode == 49, !ev.isARepeat,
-                       let self = self, ev.window === self.window {
+                    guard let self = self, ev.window === self.window,
+                          !ev.isARepeat else { return ev }
+                    if ev.keyCode == 49 {
                         self.onSpace?(mask == .keyDown)
+                    } else if ev.keyCode == 53, mask == .keyDown {
+                        self.onEscape?()
                     }
                     return ev
                 }) { monitors.append(m) }
@@ -148,6 +152,14 @@ private struct CanvasOverlay: NSViewRepresentable {
             doc?.canvasScroll(at: p, delta: d, mods: mods, viewSize: size)
         }
         v.onSpace = { [weak doc] held in doc?.spaceHeld = held }
+        // Esc: exit node-edit (SwiftUI .onExitCommand never fires — the
+        // canvas NSView is first responder and eats the keyDown)
+        v.onEscape = { [weak doc] in
+            if doc?.nodeEdit == true {
+                doc?.nodeEdit = false
+                doc?.refreshNodes()
+            }
+        }
         return v
     }
     func updateNSView(_ v: CanvasOverlayNSView, context: Context) {}
@@ -1317,6 +1329,11 @@ struct DocEditorView: View {
                     if let top = doc.layers.last(where: { hits.contains($0.id) }) {
                         doc.selected = top.id
                     }
+                }
+                // mask strokes dispatch paint-only: refresh state at
+                // stroke end so hasMask/Invert/Clear chips surface
+                if doc.maskArmed {
+                    doc.reloadState()
                 }
             }
     }
