@@ -19,7 +19,7 @@ drive the whole editor without touching the UI.
 
 | crate | what it does |
 |---|---|
-| `core` (`koubou-core`) | LibRaw decode → demosaic → CPU/wgpu develop pipeline (~60-param recipe), catalog scan + SQLite + JSON sidecars, auto-analysis, C FFI |
+| engine (`araware-core`, git dep) | LibRaw decode → demosaic → CPU/wgpu develop pipeline (~60-param recipe), catalog scan + SQLite + JSON sidecars, auto-analysis, C FFI — **lives in [araware](https://github.com/RTCK-reina/araware)**; `cargo update -p araware-core` pulls new engine work |
 | `composer` (`koubou-composer`) | `.koubou` document model, layer compositor (blend modes, masks, feather, groups), SVG-path shapes, fontdue text, PSD import, command dispatcher, FFI |
 | `cli` (`koubou-cli`) | headless render/thumb/scan/meta, `.koubou` ↔ render, `control` JSON-lines server (TCP or stdio), `mcp` server |
 | `mac/` | Koubou.app — SwiftUI library + develop editor + layered document editor |
@@ -71,7 +71,7 @@ and [`docs/parity.md`](docs/parity.md) for the per-feature tracker.
 ## Layout
 
 ```
-core/       decode, develop, catalog, engine, FFI
+engine      araware-core from github.com/RTCK-reina/araware (decode, develop, catalog, FFI) — not vendored here
 composer/   doc model, compositor, shapes, text, psd, commands, FFI
 cli/        koubou-cli (render, control, mcp)
 mac/        Koubou.app (SwiftUI) + build.sh + koubou.h

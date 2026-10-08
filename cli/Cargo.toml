@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-koubou-core = { path = "../core" }
+koubou-core.workspace = true
 koubou-composer = { path = "../composer" }
 image = "0.25"
 serde.workspace = true

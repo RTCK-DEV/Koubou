@@ -1,0 +1,16 @@
+[package]
+name = "koubou-pages"
+version = "0.1.0"
+edition = "2021"
+description = "koubou pages: multi-page layout (.kpages) — frames, text flow, PDF export"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
+fontdue = "0.9"
+fontdb = "0.23"
+flate2 = "1"
+log = "0.4"

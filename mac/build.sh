@@ -6,7 +6,10 @@ cd "$(dirname "$0")/.."
 LIBRAW_PREFIX="${LIBRAW_PREFIX:-/opt/homebrew}"
 APP=mac/build/koubou.app
 
-cargo build --release -p koubou-core -p koubou-composer
+cargo build --release -p koubou-composer
+
+# araware-core arrives as a git dependency; its staticlib is hashed under deps/
+ARAWARE_A=$(ls target/release/deps/libaraware_core-*.a | head -1)
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
@@ -35,7 +38,7 @@ swiftc -O \
   -import-objc-header mac/koubou.h \
   -o "$APP/Contents/MacOS/koubou" \
   mac/Sources/*.swift \
-  -L target/release -lkoubou_core -lkoubou_composer \
+  -L target/release "$ARAWARE_A" -lkoubou_composer \
   -L "$LIBRAW_PREFIX/lib" -lraw \
   -lc++ \
   -framework Foundation -framework AppKit -framework SwiftUI \

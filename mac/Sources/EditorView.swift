@@ -1415,7 +1415,7 @@ struct EditorView: View {
             }) {
                 if versions.isEmpty {
                     Text("Save a named snapshot of the current grade, then click it " +
-                         "to jump back. Versions persist inside the .koubou.json sidecar.")
+                         "to jump back. Versions persist inside the .araware.json sidecar.")
                         .font(.system(size: 10)).foregroundStyle(Kou.text3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1656,7 +1656,7 @@ struct EditorView: View {
         sc.versions = versions
         let stem = URL(fileURLWithPath: photo.path).deletingPathExtension().lastPathComponent
         let ok = KouEngine.shared.writeSidecar(path: photo.path, sc)
-        status = ok ? "Saved \(stem).koubou.json"
+        status = ok ? "Saved \(stem).araware.json"
                     : "Save failed: \(KouEngine.shared.lastError)"
         if ok {
             baseline = recipe

@@ -14,6 +14,10 @@ use koubou_core::Recipe;
 
 use crate::blend::BlendMode;
 
+// the styles model lives in style.rs — re-exported so `doc::DropShadow` etc.
+// keep resolving for existing users
+pub use crate::style::{DropShadow, LayerStyles};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Document {
@@ -70,31 +74,162 @@ impl Document {
         id
     }
 
+    /// add a layer at a specific stack index (0 = bottom); id is assigned
+    /// fresh and nested group children get fresh ids too so they never
+    /// collide with the compositor's (id, gen) cache.
+    pub fn add_layer_at(&mut self, mut l: Layer, at: usize) -> u64 {
+        Self::reassign_ids(&mut l, &mut self.next_id);
+        let id = l.id;
+        self.layers.insert(at.min(self.layers.len()), l);
+        id
+    }
+
+    fn reassign_ids(l: &mut Layer, next: &mut u64) {
+        l.id = *next;
+        *next += 1;
+        l.gen += 1;
+        if let LayerKind::Group { children } = &mut l.kind {
+            for c in children.iter_mut() {
+                Self::reassign_ids(c, next);
+            }
+        }
+    }
+
+    /// invalidate every layer's cached pixels (canvas resize / crop —
+    /// fills, shapes and masks all rasterize in doc space)
+    pub fn bump_all_gens(&mut self) {
+        fn bump(ls: &mut [Layer]) {
+            for l in ls.iter_mut() {
+                l.gen += 1;
+                if let LayerKind::Group { children } = &mut l.kind {
+                    bump(children);
+                }
+            }
+        }
+        bump(&mut self.layers);
+    }
+
     pub fn layer(&self, id: u64) -> Option<&Layer> {
-        self.layers.iter().find(|l| l.id == id)
+        fn find<'a>(layers: &'a [Layer], id: u64) -> Option<&'a Layer> {
+            for l in layers {
+                if l.id == id {
+                    return Some(l);
+                }
+                if let LayerKind::Group { children } = &l.kind {
+                    if let Some(f) = find(children, id) {
+                        return Some(f);
+                    }
+                }
+            }
+            None
+        }
+        find(&self.layers, id)
     }
 
     pub fn layer_mut(&mut self, id: u64) -> Option<&mut Layer> {
-        self.layers.iter_mut().find(|l| l.id == id)
+        fn find<'a>(layers: &'a mut [Layer], id: u64) -> Option<&'a mut Layer> {
+            for l in layers.iter_mut() {
+                if l.id == id {
+                    return Some(l);
+                }
+                if let LayerKind::Group { children } = &mut l.kind {
+                    if let Some(f) = find(children, id) {
+                        return Some(f);
+                    }
+                }
+            }
+            None
+        }
+        find(&mut self.layers, id)
     }
 
-    /// index of a layer (0 = bottom). usize::MAX when absent.
+    /// top-level stack index of a layer (0 = bottom); nested children and
+    /// absent ids return None — stack ops are top-level only.
     pub fn index_of(&self, id: u64) -> Option<usize> {
         self.layers.iter().position(|l| l.id == id)
     }
 
+    /// remove a layer anywhere in the tree (top level or inside a group)
     pub fn remove_layer(&mut self, id: u64) -> Option<Layer> {
-        let i = self.index_of(id)?;
-        Some(self.layers.remove(i))
+        fn remove_in(layers: &mut Vec<Layer>, id: u64) -> Option<Layer> {
+            if let Some(i) = layers.iter().position(|l| l.id == id) {
+                return Some(layers.remove(i));
+            }
+            for l in layers.iter_mut() {
+                if let LayerKind::Group { children } = &mut l.kind {
+                    if let Some(r) = remove_in(children, id) {
+                        return Some(r);
+                    }
+                }
+            }
+            None
+        }
+        remove_in(&mut self.layers, id)
     }
 
     /// move layer to a new stack index (0 = bottom)
     pub fn reorder(&mut self, id: u64, to: usize) -> bool {
-        let Some(i) = self.index_of(id) else { return false };
+        let Some(i) = self.index_of(id) else {
+            return false;
+        };
         let l = self.layers.remove(i);
         let to = to.min(self.layers.len());
         self.layers.insert(to, l);
         true
+    }
+
+    /// is `needle` the layer `hay` itself or one of its descendants?
+    /// (a group can never be moved inside its own subtree)
+    fn is_self_or_descendant(hay: &Layer, needle: u64) -> bool {
+        if hay.id == needle {
+            return true;
+        }
+        match &hay.kind {
+            LayerKind::Group { children } => children
+                .iter()
+                .any(|c| Self::is_self_or_descendant(c, needle)),
+            _ => false,
+        }
+    }
+
+    /// move a layer to (parent group, index). `parent` None = top level.
+    /// Refuses cycles (a group into itself/descendants), missing layers and
+    /// non-group parents — the tree is untouched on failure.
+    pub fn move_layer(&mut self, id: u64, parent: Option<u64>, to: usize) -> bool {
+        let Some(l) = self.layer(id) else {
+            return false;
+        };
+        if let Some(pid) = parent {
+            // parent must exist, be a group, and not sit inside the moved layer
+            match self.layer(pid) {
+                Some(p) if matches!(p.kind, LayerKind::Group { .. }) => {}
+                _ => return false,
+            }
+            if Self::is_self_or_descendant(l, pid) {
+                return false;
+            }
+        }
+        let Some(l) = self.remove_layer(id) else {
+            return false;
+        };
+        match parent {
+            None => {
+                self.layers.insert(to.min(self.layers.len()), l);
+                true
+            }
+            Some(pid) => match self.layer_mut(pid).map(|p| &mut p.kind) {
+                Some(LayerKind::Group { children }) => {
+                    children.insert(to.min(children.len()), l);
+                    true
+                }
+                // unreachable after the checks above, but never drop a
+                // layer from the document on a failed move
+                _ => {
+                    self.layers.push(l);
+                    false
+                }
+            },
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -110,7 +245,8 @@ impl Document {
     }
 
     pub fn load(path: &Path) -> Result<Document> {
-        let s = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let s =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Document::from_json(&s)
     }
 }
@@ -140,6 +276,9 @@ pub struct Layer {
     /// content generation — bumped on every content edit for cache invalidation
     #[serde(default)]
     pub gen: u64,
+    /// layer styles (drop shadow etc.) rendered beneath this layer
+    #[serde(default)]
+    pub styles: LayerStyles,
     #[serde(flatten)]
     pub kind: LayerKind,
 }
@@ -161,6 +300,7 @@ impl Layer {
             scale: 1.0,
             mask: None,
             gen: 0,
+            styles: LayerStyles::default(),
             kind,
         }
     }
@@ -228,7 +368,10 @@ impl Layer {
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum LayerKind {
     /// a source file (RAW or raster) developed live through the engine
-    Develop { path: PathBuf, recipe: Recipe },
+    Develop {
+        path: PathBuf,
+        recipe: Recipe,
+    },
     /// baked pixels
     Raster {
         width: u32,
@@ -236,12 +379,22 @@ pub enum LayerKind {
         src: RasterSrc,
     },
     /// tone/colour operations applied to the composite of everything below
-    Adjustment { recipe: Recipe },
-    Fill { fill: Fill },
-    Shape { shapes: Vec<Shape> },
-    Text { text: TextContent },
+    Adjustment {
+        recipe: Recipe,
+    },
+    Fill {
+        fill: Fill,
+    },
+    Shape {
+        shapes: Vec<Shape>,
+    },
+    Text {
+        text: TextContent,
+    },
     /// children composite into an isolated buffer, blended as one layer
-    Group { children: Vec<Layer> },
+    Group {
+        children: Vec<Layer>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,6 +505,9 @@ pub struct Stroke {
     pub color: [f32; 4],
     #[serde(default = "one_f")]
     pub width: f32,
+    /// SVG dasharray — alternating dash/gap lengths in px
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dash: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

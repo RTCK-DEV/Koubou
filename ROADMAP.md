@@ -22,44 +22,77 @@ Two honest ledgers, like the craft-suite docs that inspired this format:
   no cloud sync, no HDR merge/pano
 - 🟡 Camera colour = LibRaw's matrices; no per-model DCP calibration beyond it
 
-**vs Photoshop** — layered editing, ~35%: the *core* model is here, the
+**vs Photoshop** — layered editing, ~45%: the *core* model is here, the
 polish isn't:
 
 - ✅ Layers (raster/develop/adjustment/fill/shape/text/group), masks with
-  feather, 27 blend modes (PDF/W3C), opacity/transform, PSD *import*
-- 🟡 Adjustment layers run the full develop recipe — but the doc editor UI
-  only exposes a slider subset (curves/wheels/qualifier editable via
-  commands, not yet the app's inspector)
-- 🟡 No undo/redo in the doc editor yet (session store + doc.json diffing
-  planned); the single-photo editor has recipe undo already
-- 🟡 Canvas is view+paint only: no drag-move, no marquee/lasso, no on-canvas
-  text editing — placement is numeric (x/y/scale) for now
-- ❌ No PSD *export*, smart objects, layer styles (drop shadow/stroke),
-  channel ops, filter gallery, liquify, text-on-path
-- ❌ Groups composite correctly but the UI can't nest/drag layers into them yet
+  feather, 27 blend modes (PDF/W3C), opacity/transform, layered PSD
+  import + export, JPEG/TIFF/PNG export
+- ✅ Doc inspector exposes the full recipe: light/wheels/curves/zones/
+  qualifier/windows/mixer/detail/fx palettes — same UI as develop
+- ✅ Undo/redo everywhere: per-domain snapshot stacks (cap 32) behind
+  `doc.undo`/`tl.undo`/`pg.undo` (+`.redo`), wired to ⌘Z/⇧⌘Z in the app's
+  Edit menu; `batch` runs atomic multi-command transactions
+- ✅ Canvas direct manipulation: alpha-precise pick, drag-move with live
+  outline, corner scale handles, marquee → multi-select, double-click
+  on-canvas text editing (overlay windows painted via WindowServer ops
+  during event tracking)
+- ✅ Groups: disclosure nesting, ⌘-click multi-select, group/ungroup,
+  drag reorder + reparent in the layers panel (`doc.moveLayer`)
+- ✅ Canvas pan/zoom: scroll-wheel pan, ⌘+scroll zoom about cursor, pinch
+  zoom, spacebar drag-pan, toolbar −/+ and % menu (⌘0/⌘=/⌘-)
+- ✅ Vector node editing: double-click a shape → anchor handles
+  (line=circle, curve=square), drag to move via `doc.shapeNodes`/
+  `doc.moveNode`, Esc exits
+- ✅ Mask UX improved: Invert chip + brush softness slider in the mask
+  panel (`doc.maskInvert`, `softness` on `doc.maskPaint`)
+- ✅ Layer styles: full PS set (shadows, glows, bevel/emboss, satin,
+  color/gradient/pattern overlays, stroke) via `doc.styleSet` + inspector
+- ✅ Layered PSD export: layer records, groups, masks, 27 blend keys,
+  visibility/opacity/offsets (`doc.exportPsd`; `flat:true` for merged)
+- ❌ Smart objects, channel ops, filter gallery, liquify, text-on-path
 
-**vs the storytold craft suite** — what this beats / what it doesn't:
+**vs the storytold craft suite** — one app now spans all seven domains:
 
 - ✅ Beats on imaging: LibRaw decode breadth and camera colour where
   lightcraft falls back to embedded JPEGs and uncalibrated matrices
-- ✅ Beats on unity: Lightroom+Photoshop in one document model — the craft
-  suite splits them across apps that can't share a file format
-- 🟡 Behind on plumbing maturity: they have undo stacks, menus, shortcut
-  maps and a full xtask CI harness; Koubou has the command core and the
-  tracker, not yet the polish
+- ✅ Beats on unity: library + develop + layers + vector + motion + pages +
+  PDF in one session/document protocol — the craft suite splits them
+  across apps that can't share a file format or a session
+- ✅ Motion: .kmotion timeline (tracks/clips/cues/keyframes/fades) with
+  ffmpeg render, silence detection, Speech-framework transcription, and
+  minimax-h3 generative clip inserts — filmcraft+effectcraft in one
+- ✅ Pages: .kpages layout doc with frames/masters and a hand-rolled
+  PDF 1.4 writer — designcraft's core; PDF *import* (PDFKit → layers)
+  covers printcraft's read path
+- ✅ Vector: parametric shape generators + dashed strokes on shape layers
+- ✅ Transitions: per-edge slide/wipe/dip on clips (`transIn`/`transOut`);
+  audio: per-clip volume keyframes + `tl.duck` auto-ducking under cues;
+  CJK subtitle glyphs via fontdb fallback
+- ✅ Pages depth: threaded text frames (`pg.linkFrames`), facing spreads
+  (`pg.setSpread`), paragraph styles (`pg.setStyle`/`pg.applyStyle`),
+  page size (`pg.setPageSize`), CJK-safe PDF text (rasterize+SMask)
+- 🟡 Plumbing is catching up: per-domain undo stacks + Edit-menu ⌘Z are
+  in, and every command now carries a generated MCP tool spec (single
+  registry, no schema drift) + atomic `batch`; still no persisted command
+  journal or xtask-style CI harness
+- ✅ Motion edit depth: ripple ops (`tl.rippleDelete`/`tl.rippleInsert`),
+  edge trims (`tl.trim`), constant playback rate (`rate` → setpts retime +
+  chained atempo), per-clip 3-band EQ + compressor (`eq`/`comp` → ffmpeg
+  equalizer/acompressor) — all with inspector UI
+- ❌ No path boolean ops, no PDF annotation/preflight, no speed ramps or
+  GPU realtime playback — the deep ends of each domain
 
 ## Where we're going (ordered)
 
-1. **Undo/redo for documents** — command-level snapshot history in the
-   session (bounded by memory), exposed as `doc.undo`/`doc.redo`
-2. **Doc inspector parity** — curves, wheels, qualifier and power windows
-   in the layer inspector (the recipe engine already does all of it)
-3. **Canvas manipulation** — drag-move layers, marquee select, on-canvas
-   text edit, transform handles
-4. **Mask UX** — mask thumbnail, gradient/brush tools, mask-from-qualifier
-5. **Export breadth** — JPEG/TIFF/WebP export with size/quality options;
-   PSD export if a sane writer exists
-6. **Groups in UI** — nesting, expand/collapse, drag between levels
+1. **Mask UX** — mask thumbnail, gradient/brush tools, mask-from-qualifier
+2. **Boolean vector ops + SVG import/export**
+3. **Speed ramps** — constant rate landed (`tl.setClip rate`); ramps
+   = split + per-clip rate until keyframed rate exists
+4. **Real playback in Motion** — GPU realtime instead of frame stepping
+5. **PSD depth** — styles as native PSD effects, clipping masks, smart
+   objects (layered export keeps pixels + metadata, not editability)
+6. **Gradient editor for layer styles** — stops UI; params only today
 7. **xtask CI** — fmt/clippy/layers/parity in one command (today:
    `scripts/parity_check.sh` + `cargo test --workspace`)
 8. **Batch ops** — scan folder → apply recipe → export, via the CLI/MCP

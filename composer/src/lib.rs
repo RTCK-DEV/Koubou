@@ -11,6 +11,8 @@ pub mod composite;
 pub mod doc;
 pub mod psd;
 pub mod shape;
+pub mod specs;
+pub mod style;
 pub mod text;
 
 pub use blend::BlendMode;

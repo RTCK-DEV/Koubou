@@ -2,38 +2,156 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+/// Menus are authored wholesale via `.commandsReplaced` — this is the only
+/// SwiftUI surface where the stock Edit-menu Undo/Redo can actually be
+/// replaced: `CommandGroup(replacing: .undoRedo)` keeps the AppKit items
+/// (permanently disabled — SwiftUI manages their state), responder-chain
+/// `undo:` on the app delegate is never consulted for them, and
+/// didFinishLaunching menu surgery is clobbered when SwiftUI rebuilds the
+/// main menu. Undo/redo here route to the active workspace's
+/// command-protocol history (doc./tl./pg.).
 @main
 struct KouApp: App {
-    @StateObject private var store = LibraryStore()
+    @StateObject private var store = LibraryStore.shared
 
     var body: some Scene {
         WindowGroup("koubou") {
-            LibraryView()
+            StudioView()
                 .environmentObject(store)
-                .frame(minWidth: 1080, minHeight: 660)
+                .frame(minWidth: 1120, minHeight: 700)
         }
         .windowToolbarStyle(.unifiedCompact)
-        .commands {
-            CommandGroup(after: .newItem) {
+        .commandsReplaced {
+            CommandMenu("koubou") {
+                Button("About koubou") { NSApp.orderFrontStandardAboutPanel(nil) }
+                Divider()
+                Button("Hide koubou") { NSApp.hide(nil) }
+                    .keyboardShortcut("h", modifiers: .command)
+                Button("Quit koubou") { NSApp.terminate(nil) }
+                    .keyboardShortcut("q", modifiers: .command)
+            }
+            CommandMenu("File") {
+                Button("New Document") { store.newDocument() }
+                    .keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("Open Document…") { store.openDocument() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                Divider()
                 Button("Open Folder…") { store.pickFolder() }
                     .keyboardShortcut("o", modifiers: .command)
                 Divider()
-                Button("New Document") { store.newDocument() }
-                    .keyboardShortcut("n", modifiers: .command)
-                Button("Open Document…") { store.openDocument() }
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("New Timeline") { store.mode = .motion }
+                Button("New Pages Doc") { store.mode = .pages }
+                Divider()
+                Button("Import PDF as Document…") { store.doc.importPdf() }
+            }
+            CommandMenu("Edit") {
+                Button("Undo") { store.undo() }
+                    .keyboardShortcut("z", modifiers: .command)
+                Button("Redo") { store.redo() }
+                    .keyboardShortcut("z", modifiers: [.command, .shift])
+                Divider()
+                // standard editing actions — sent down the responder
+                // chain so text fields in any inspector work as usual
+                Button("Cut") { NSApp.sendAction(Selector(("cut:")), to: nil, from: nil) }
+                    .keyboardShortcut("x", modifiers: .command)
+                Button("Copy") { NSApp.sendAction(Selector(("copy:")), to: nil, from: nil) }
+                    .keyboardShortcut("c", modifiers: .command)
+                Button("Paste") { NSApp.sendAction(Selector(("paste:")), to: nil, from: nil) }
+                    .keyboardShortcut("v", modifiers: .command)
+                Button("Select All") { NSApp.sendAction(Selector(("selectAll:")), to: nil, from: nil) }
+                    .keyboardShortcut("a", modifiers: .command)
+            }
+            CommandMenu("Window") {
+                Button("Minimize") { NSApp.keyWindow?.miniaturize(nil) }
+                    .keyboardShortcut("m", modifiers: .command)
+                Button("Zoom") { NSApp.keyWindow?.zoom(nil) }
+                Divider()
+                Button("Close") { NSApp.keyWindow?.performClose(nil) }
+                    .keyboardShortcut("w", modifiers: .command)
+            }
+            CommandMenu("Help") {
+                Button("koubou Help") {
+                    NSWorkspace.shared.open(URL(string: "https://github.com/RTCK-reina/Koubou")!)
+                }
             }
         }
     }
 }
 
+/// Workspace modes — one window, every craft domain.
+enum StudioMode: String, CaseIterable {
+    case library = "Library"
+    case doc = "Layers"
+    case motion = "Motion"
+    case pages = "Pages"
+}
+
+struct StudioView: View {
+    @EnvironmentObject var store: LibraryStore
+
+    var body: some View {
+        VStack(spacing: 0) {
+            modeBar
+            Divider()
+            content
+        }
+        .background(Kou.bg0)
+    }
+
+    private var modeBar: some View {
+        HStack(spacing: 4) {
+            ForEach(StudioMode.allCases, id: \.self) { m in
+                Button {
+                    store.mode = m
+                } label: {
+                    Text(m.rawValue)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .padding(.horizontal, 12).padding(.vertical, 5)
+                        .background(
+                            Capsule().fill(store.mode == m ? Kou.accent.opacity(0.9) : Color.clear))
+                        .foregroundStyle(store.mode == m ? .black : .secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+    }
+
+    @ViewBuilder private var content: some View {
+        switch store.mode {
+        case .library: LibraryView()
+        case .doc: DocEditorView(doc: store.doc) { store.mode = .library }
+        case .motion: MotionView(m: store.motion)
+        case .pages: PagesView(p: store.pages)
+        }
+    }
+}
+
 final class LibraryStore: ObservableObject {
+    /// single instance — the app is one shared document/session world
+    static let shared = LibraryStore()
+
     @Published var photos: [Photo] = []
     @Published var folder: URL?
     @Published var selection: Photo?
     /// layered-document workspace (koubou-composer session)
     let doc = DocStore()
-    @Published var editingDoc = false
+    /// video timeline workspace (koubou-motion session)
+    let motion = MotionStore()
+    /// page-layout workspace (koubou-pages session)
+    let pages = PagesStore()
+    /// active workspace
+    @Published var mode: StudioMode = .library {
+        didSet {
+            // entering a workspace lazily creates its document
+            if mode == .motion && !motion.opened { motion.newTimeline() }
+            if mode == .pages && !pages.opened { pages.newDoc() }
+        }
+    }
+    @Published var editingDoc = false {
+        didSet { if editingDoc { mode = .doc } }
+    }
     @Published var scanning = false
     @Published var minRating = 0
     @Published var labelFilter = ""
@@ -48,6 +166,21 @@ final class LibraryStore: ObservableObject {
 
     /// Same idea for grade-version lists (they live in the sidecar file).
     var unsavedVersions: [String: [GradeVersion]] = [:]
+
+    private init() {}
+
+    /// undo/redo goes to the session that owns the active workspace —
+    /// the command protocol keeps per-domain history stacks.
+    func undo() { history("undo") }
+    func redo() { history("redo") }
+    private func history(_ op: String) {
+        switch mode {
+        case .doc: doc.dispatch(["id": "doc.\(op)"])
+        case .motion: motion.dispatch(["id": "tl.\(op)"])
+        case .pages: pages.dispatch(["id": "pg.\(op)"])
+        case .library: break
+        }
+    }
 
     /// distinct camera/lens names seen in the current folder (filter menus)
     var cameras: [String] { Array(Set(photos.map(\.camera).filter { !$0.isEmpty })).sorted() }
@@ -129,7 +262,7 @@ final class LibraryStore: ObservableObject {
     /// Promote the selected photo into a layered document and switch views.
     func editAsDocument() {
         guard let p = selection else { return }
-        editingDoc = true
+        mode = .doc
         doc.fromPhoto(p.path)
     }
 
@@ -141,12 +274,12 @@ final class LibraryStore: ObservableObject {
             p.allowedContentTypes = [t, UTType(filenameExtension: "psd") ?? .data]
         }
         guard p.runModal() == .OK, let url = p.url else { return }
-        editingDoc = true
+        mode = .doc
         doc.open(url)
     }
 
     func newDocument() {
-        editingDoc = true
+        mode = .doc
         doc.newDoc()
     }
 }

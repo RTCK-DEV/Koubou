@@ -1,9 +1,14 @@
 # Koubou — instructions for agents
 
-All-in-one macOS photo app: Lightroom-style library + RAW develop
-(`koubou-core`, from araware) plus a Photoshop-style layered document
-engine (`koubou-composer`). MIT. LibRaw is dynamically linked; no GPL code
-in the tree.
+All-in-one macOS photo app: Lightroom-style library + RAW develop plus a
+Photoshop-style layered document engine (`koubou-composer`). MIT. LibRaw
+is dynamically linked; no GPL code in the tree.
+
+The RAW engine is **`araware-core`, consumed as a git dependency** tracking
+araware's `devin/initial-implementation` branch — never vendor or fork
+engine code here. Engine bugs/features are fixed in araware and pulled in
+via `cargo update -p araware-core`; only Koubou-specific glue (documents,
+compositing, FFI, UI) lives in this tree.
 
 ## Start every session here
 
@@ -38,8 +43,9 @@ produce an actionable error, never a panic.
 All engine and document operations are dispatch ids (`docs/control-protocol.md`).
 UI, CLI, control channel and MCP all go through `Session::dispatch`. When
 you add a capability, expose it as a command id + params, add it to
-`command_ids`, the CLI tool schemas (`mcp_tools`), and `docs/parity.md`'s
-`cmd:` citations — not just to a Swift view.
+`command_ids` **and** `command_specs` (the single registry the MCP
+`tools/list` is generated from — a test asserts the two stay in sync), and
+`docs/parity.md`'s `cmd:` citations — not just to a Swift view.
 
 ## The layer-id protocol quirk
 
@@ -72,12 +78,21 @@ consistent with this.
 
 ## Map of the code
 
-- `core/`: `decode` (LibRaw+raster) → `demosaic` → `develop` (recipe ops)
-  → `engine` (scan/render/thumb/meta/sidecars/auto) → `capi` (`koubou_*` FFI)
+- engine (external): `araware-core` git dep — `decode` (LibRaw+raster) →
+  `develop` (recipe ops) → `engine` (scan/render/thumb/meta/sidecars/auto)
+  → `araware_*` C FFI. Sidecars are `<stem>.araware.json` (shared with
+  araware); env: `ARA_DISABLE_GPU`, `ARAWARE_HOME`.
 - `composer/`: `doc` (model+serde), `composite` (layer stack renderer),
-  `blend` (27 modes), `shape` (SVG path → tiny-skia), `text` (fontdue +
-  fontdb), `psd` (import), `commands` (dispatch), `capi` (`kou_*` FFI)
+  `blend` (27 modes), `shape` (SVG path → tiny-skia + generators + dash),
+  `text` (fontdue + fontdb), `psd` (import), `commands` (dispatch — routes
+  `tl.*`→motion, `pg.*`→pages), `capi` (`kou_*` FFI)
+- `motion/`: `.kmotion` timeline (tracks/clips/keyframes/cues) + ffmpeg
+  render + silencedetect + minimax-h3 `tl.generateClip`
+- `pages/`: `.kpages` multi-page layout + hand-rolled PDF 1.4 writer
 - `cli/`: `main.rs` — file verbs, `control` (TCP/stdio), `mcp`
-- `mac/`: `KoubouApp` (store+menus), `LibraryView` (grid), `EditorView`
-  (single-photo develop), `DocEditorView` (layers workspace), `Engine.swift`
+- `mac/`: `KoubouApp`+`StudioView` (mode switch: Library|Layers|Motion|
+  Pages), `LibraryView` (grid), `EditorView` (single-photo develop),
+  `DocEditorView` (layers workspace + vector generators + PDF import via
+  PDFKit), `MotionView` (timeline + Speech transcription + h3ui generate),
+  `PagesView` (page thumbnails + frame inspector), `Engine.swift`
   (`EngineSession`, `DocSession` FFI wrappers)
