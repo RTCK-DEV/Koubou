@@ -608,7 +608,7 @@ impl Session {
                 if v.get("flat").and_then(Value::as_bool).unwrap_or(false) {
                     let img = c.render()?;
                     crate::psd::write_flat_psd(Path::new(&p), img.width, img.height, &img.data)?;
-                    Ok(json!({"path": p, "layers": 0}))
+                    Ok(json!({"path": p, "layers": 0, "groups": 0}))
                 } else {
                     let stats = crate::psd::write_layered_psd(c, Path::new(&p))?;
                     Ok(json!({"path": p, "layers": stats.layers, "groups": stats.groups}))
