@@ -246,7 +246,10 @@ fn push_pixel(recs: &mut Vec<Rec>, layer: &Layer, pix: &LayerPixels) {
         }
         out
     };
-    let mask = layer.mask.as_ref().map(export_mask);
+    let mask = layer
+        .mask
+        .as_ref()
+        .map(|m| export_mask(m, scale, w, h, layer.x, layer.y));
     recs.push(Rec::Pixel(PixelRec {
         name: layer.name.clone(),
         id: layer.id,
@@ -262,12 +265,14 @@ fn push_pixel(recs: &mut Vec<Rec>, layer: &Layer, pix: &LayerPixels) {
     }));
 }
 
-/// bake feather + invert + density into u8 coverage. The mask bitmap
-/// is document-space (mask_at is sampled at doc coords, independent of
-/// layer x/y/scale) so the record is anchored at the doc origin and the
-/// rect equals the buffer — never offset it by the layer position or a
-/// strict reader will double-offset it.
-fn export_mask(m: &Mask) -> MaskRec {
+/// bake feather + invert + density into u8 coverage over the layer's
+/// pixel rect. The mask bitmap is indexed in LAYER-LOCAL coords — the
+/// compositor calls mask_at(sx, sy) with layer-pixel space — so the
+/// record rect is the layer's pixel rect in absolute doc coordinates
+/// (flags = 0) and buffer (gx,gy) ↔ mask point (gx/scale, gy/scale),
+/// identical sampling to blend_layer. Never write a doc-space origin:
+/// that misplaces the coverage whenever x/y ≠ 0.
+fn export_mask(m: &Mask, scale: f32, w: u32, h: u32, x: i32, y: i32) -> MaskRec {
     let blurred;
     let m = if m.feather > 0.0 {
         blurred = blur_mask(m);
@@ -275,19 +280,18 @@ fn export_mask(m: &Mask) -> MaskRec {
     } else {
         m
     };
-    let (w, h) = (m.width, m.height);
     let mut gray = vec![0u8; (w * h) as usize];
     for gy in 0..h {
         for gx in 0..w {
             // mask_at() applies floor sampling + invert + density — the
             // same effective coverage the compositor uses
-            let v = mask_at(m, gx as f32, gy as f32);
+            let v = mask_at(m, gx as f32 / scale, gy as f32 / scale);
             gray[(gy * w + gx) as usize] = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
         }
     }
     MaskRec {
-        top: 0,
-        left: 0,
+        top: y,
+        left: x,
         w,
         h,
         gray,
