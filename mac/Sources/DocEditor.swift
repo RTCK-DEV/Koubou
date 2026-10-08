@@ -377,7 +377,7 @@ final class DocStore: ObservableObject {
         throttleSeq += 1   // cancel the pending throttled write
         guard let l = Self.find(id, in: layers) else { return }
         setLayer(id, ["x": Int(l.x.rounded()), "y": Int(l.y.rounded()),
-                      "scale": l.scale], then: .reloadImage)
+                      "scale": l.scale], then: .reload)
         refreshBounds()
     }
 
@@ -575,7 +575,7 @@ final class DocStore: ObservableObject {
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 130_000_000)
             guard let self, n == self.throttleSeq else { return }
-            self.setLayer(id, params, then: .reloadImage)
+            self.setLayer(id, params, then: .reload)
         }
     }
 
@@ -1345,7 +1345,7 @@ struct DocEditorView: View {
         if let ed = doc.textEdit {
             var t = DocStore.find(ed.id, in: doc.layers)?.text ?? [:]
             t["text"] = ed.text
-            doc.setLayer(ed.id, ["text": t], then: .reloadImage)
+            doc.setLayer(ed.id, ["text": t], then: .reload)
         }
         doc.textEdit = nil
     }
@@ -1753,7 +1753,7 @@ struct LayerInspector: View {
         st.removeValue(forKey: key)
         doc.setLayer(layer.id,
                      ["styles": st.isEmpty ? NSNull() : st],
-                     then: .reloadImage)
+                     then: .reload)
     }
 
     private func fxVal(_ key: String, _ p: String, _ def: Double) -> Double {
@@ -1930,7 +1930,7 @@ struct LayerInspector: View {
                 Text("Name").font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(Kou.text2).frame(width: 60, alignment: .leading)
                 CommitField(initial: layer.name) {
-                    doc.setLayer(layer.id, ["name": $0], then: .reloadImage)
+                    doc.setLayer(layer.id, ["name": $0], then: .reload)
                 }
             }
             DebSliderRow("Opacity", value: layer.opacity, range: 0...1, reset: 1) {
@@ -2474,7 +2474,7 @@ struct TextInspector: View {
         if throttle {
             doc.setLayerThrottled(layer.id, ["text": nt])
         } else {
-            doc.setLayer(layer.id, ["text": nt], then: .reloadImage)
+            doc.setLayer(layer.id, ["text": nt], then: .reload)
         }
     }
 
@@ -2609,7 +2609,7 @@ struct ShapeInspector: View {
     @State private var dText = ""
 
     private func setShapes(_ shapes: [[String: Any]]) {
-        doc.setLayer(layer.id, ["shapes": shapes], then: .reloadImage)
+        doc.setLayer(layer.id, ["shapes": shapes], then: .reload)
     }
 
     var body: some View {
