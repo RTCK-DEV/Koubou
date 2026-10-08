@@ -14,6 +14,10 @@ use koubou_core::Recipe;
 
 use crate::blend::BlendMode;
 
+// the styles model lives in style.rs — re-exported so `doc::DropShadow` etc.
+// keep resolving for existing users
+pub use crate::style::{DropShadow, LayerStyles};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Document {
@@ -277,37 +281,6 @@ pub struct Layer {
     pub styles: LayerStyles,
     #[serde(flatten)]
     pub kind: LayerKind,
-}
-
-/// Photoshop-style layer effects; all absent/default = no styling.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LayerStyles {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drop_shadow: Option<DropShadow>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DropShadow {
-    /// offset in document pixels
-    #[serde(default)]
-    pub dx: f32,
-    #[serde(default)]
-    pub dy: f32,
-    /// blur radius in px
-    #[serde(default)]
-    pub blur: f32,
-    /// [r,g,b,a] 0..1 sRGB
-    #[serde(default = "default_shadow_color")]
-    pub color: [f32; 4],
-    /// spread: expands the silhouette before blurring, 0..1
-    #[serde(default)]
-    pub spread: f32,
-}
-
-fn default_shadow_color() -> [f32; 4] {
-    [0.0, 0.0, 0.0, 0.5]
 }
 
 fn one_f() -> f32 {

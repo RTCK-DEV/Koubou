@@ -366,6 +366,9 @@ impl Session {
             "doc.maskPaint",
             "doc.maskRect",
             "doc.maskInvert",
+            "doc.styleSet",
+            "doc.styleClear",
+            "doc.styleScale",
             "doc.group",
             "doc.ungroup",
             "doc.addShape",
@@ -510,6 +513,48 @@ impl Session {
                 let c = self.composer.as_mut().context("no document")?;
                 let id = layer_id(v)?;
                 set_layer(&mut c.doc, id, v)
+            }
+            "doc.styleSet" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let effect = req_str(v, "effect")?;
+                let params = v.get("params").cloned().unwrap_or(json!({}));
+                let l = c
+                    .doc
+                    .layer_mut(id)
+                    .with_context(|| format!("layer {id} not found"))?;
+                l.styles
+                    .set_effect(&effect, &params)
+                    .with_context(|| format!("effect '{effect}'"))?;
+                l.gen += 1;
+                Ok(json!("ok"))
+            }
+            "doc.styleClear" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let effect = v.get("effect").and_then(Value::as_str);
+                let l = c
+                    .doc
+                    .layer_mut(id)
+                    .with_context(|| format!("layer {id} not found"))?;
+                l.styles.clear_effect(effect)?;
+                l.gen += 1;
+                Ok(json!("ok"))
+            }
+            "doc.styleScale" => {
+                let c = self.composer.as_mut().context("no document")?;
+                let id = layer_id(v)?;
+                let s = v
+                    .get("scale")
+                    .and_then(Value::as_f64)
+                    .context("'scale' (multiplier) required")?;
+                let l = c
+                    .doc
+                    .layer_mut(id)
+                    .with_context(|| format!("layer {id} not found"))?;
+                l.styles.scale(s as f32);
+                l.gen += 1;
+                Ok(json!("ok"))
             }
             "doc.removeLayer" => {
                 let c = self.composer.as_mut().context("no document")?;
@@ -1883,5 +1928,91 @@ mod tests {
             r["result"]["changed"], true,
             "redo must survive failed atomic batch"
         );
+    }
+
+    fn add_raster(s: &mut Session) -> u64 {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(vec![255u8; 8 * 8 * 4]);
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.addLayer", "kind": "raster", "name": "sq",
+                    "w": 8, "h": 8, "x": 10, "y": 10, "rgbaB64": b64}),
+        ));
+        assert_eq!(r["ok"], true, "{r}");
+        r["result"]["layerId"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn style_set_clear_scale() {
+        let mut s = s();
+        new_doc(&mut s);
+        let lid = add_raster(&mut s);
+
+        // defaults come up when only a flag is merged
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.styleSet", "layer": lid, "effect": "dropShadow",
+                    "params": {"dx": 12}}),
+        ));
+        assert_eq!(r["ok"], true, "{r}");
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let st = &doc["result"]["layers"][0]["styles"]["dropShadow"];
+        assert_eq!(st["dx"], 12.0);
+        assert_eq!(st["enabled"], true);
+
+        // merge keeps earlier params
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.styleSet", "layer": lid, "effect": "dropShadow",
+                    "params": {"blur": 4}}),
+        ));
+        assert_eq!(r["ok"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let st = &doc["result"]["layers"][0]["styles"]["dropShadow"];
+        assert_eq!(st["dx"], 12.0);
+        assert_eq!(st["blur"], 4.0);
+
+        // eye toggle via merge
+        s.dispatch(&d(
+            &json!({"id": "doc.styleSet", "layer": lid, "effect": "dropShadow",
+                    "params": {"enabled": false}}),
+        ));
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(
+            doc["result"]["layers"][0]["styles"]["dropShadow"]["enabled"],
+            false
+        );
+
+        // unknown effect errors, doesn't panic
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.styleSet", "layer": lid, "effect": "neon"}),
+        ));
+        assert_eq!(r["ok"], false);
+
+        // styleScale multiplies px params, leaves ratios
+        let r = s.dispatch(&d(
+            &json!({"id": "doc.styleScale", "layer": lid, "scale": 2}),
+        ));
+        assert_eq!(r["ok"], true);
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        let st = &doc["result"]["layers"][0]["styles"]["dropShadow"];
+        assert_eq!(st["dx"], 24.0);
+        assert_eq!(st["blur"], 8.0);
+
+        // clear one effect, then all
+        s.dispatch(&d(
+            &json!({"id": "doc.styleClear", "layer": lid, "effect": "dropShadow"}),
+        ));
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert!(doc["result"]["layers"][0]["styles"]["dropShadow"].is_null());
+        s.dispatch(&d(
+            &json!({"id": "doc.styleSet", "layer": lid, "effect": "stroke",
+                    "params": {"size": 5}}),
+        ));
+        s.dispatch(&d(&json!({"id": "doc.styleClear", "layer": lid})));
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert!(doc["result"]["layers"][0]["styles"]["stroke"].is_null());
+
+        // undo restores the styles
+        s.dispatch(&d(&json!({"id": "doc.undo"})));
+        let doc = s.dispatch(&d(&json!({"id": "doc.json"})));
+        assert_eq!(doc["result"]["layers"][0]["styles"]["stroke"]["size"], 5.0);
     }
 }

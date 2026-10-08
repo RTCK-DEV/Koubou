@@ -39,8 +39,9 @@ polish isn't:
   during event tracking)
 - ✅ Groups: disclosure nesting, ⌘-click multi-select, group/ungroup,
   drag reorder + reparent in the layers panel (`doc.moveLayer`)
-- 🟡 Layer styles: drop shadow only (glow/stroke/bevel missing); no
-  layered PSD export (flat only)
+- ✅ Layer styles: full PS set (shadows, glows, bevel/emboss, satin,
+  color/gradient/pattern overlays, stroke) via `doc.styleSet` + inspector;
+  no layered PSD export (flat only)
 - ❌ Smart objects, channel ops, filter gallery, liquify, text-on-path,
   canvas pan/zoom (fit-only)
 
@@ -76,8 +77,7 @@ polish isn't:
 1. **Mask UX** — mask thumbnail, gradient/brush tools, mask-from-qualifier
 2. **Layered PSD export** — a real writer that keeps layers, not the
    current flat composite
-3. **Layer styles** — glow, stroke, bevel beyond today's drop shadow
-4. **Canvas pan/zoom** — fit-only today; needs scroll zoom + spacebar pan
+3. **Canvas pan/zoom** — fit-only today; needs scroll zoom + spacebar pan
 5. **Vector node editing** — boolean ops, path point handles, SVG import
 6. **Ripple editing + speed ramps**, real playback in Motion
 7. **EQ/comp UI in Motion** — per-clip audio filters (params exist)

@@ -70,7 +70,7 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | On-canvas text editing | ✅ | double-click a text layer → in-place editor (Esc commits) |
 | Undo/redo (all domains, ⌘Z in-app) | ✅ | `cmd:doc.undo`, `doc.redo`, `tl.undo`, `tl.redo`, `pg.undo`, `pg.redo` — snapshot stacks, cap 32 |
 | Merge down / flatten / canvas resize+crop | ✅ | `doc.mergeDown`, `doc.flatten`, `doc.resize`, `doc.crop`, `doc.setBackdrop` |
-| Layer styles | 🟡 | drop shadow via `doc.setLayer styles={dropShadow}` (dx,dy,blur,spread,color) — glow/stroke/bevel ❌ |
+| Layer styles | ✅ | `cmd:doc.styleSet`/`doc.styleClear`/`doc.styleScale` + `doc.setLayer styles={...}` — dropShadow, innerShadow, outerGlow, innerGlow (edge/center), bevel (5 styles, dir, altitude), satin, color/gradient/pattern overlays, stroke (out/in/center); per-effect blend+eye; inspector panel + fx badge |
 | Mask shortcuts (rect fill, feather) | ✅ | `cmd:doc.maskRect` (layer-space, feather param) |
 | Smart objects / linked docs | ❌ | — |
 | Channels palette, alpha ops | ❌ | — |
@@ -95,9 +95,9 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 
 1. Mask UX (thumbnail, gradient tool, mask view)
 2. Layered PSD export (composite-only today)
-3. Layer styles beyond drop shadow (glow, stroke, bevel)
-4. Canvas pan/zoom (fit-to-view only)
-5. Boolean vector ops / node editing
+3. Canvas pan/zoom (fit-to-view only)
+4. Boolean vector ops / node editing
+5. Gradient editor for layer styles (stops UI; params only today)
 
 ## Vector / design (vectorcraft)
 

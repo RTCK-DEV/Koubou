@@ -1377,6 +1377,11 @@ struct LayerRow: View {
                 Image(systemName: "rectangle.dashed")
                     .font(.system(size: 8)).foregroundStyle(Kou.text3)
             }
+            if let st = layer.styles, !st.isEmpty {
+                Text("fx")
+                    .font(.system(size: 8, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Kou.accent)
+            }
             if layer.blend.lowercased() != "normal" {
                 Text(blendLabel(layer.blend))
                     .font(.system(size: 8)).foregroundStyle(Kou.text3)
@@ -1412,95 +1417,224 @@ struct LayerInspector: View {
 
     // ---- layer styles (drop shadow) ----
 
-    private var shadow: [String: Any]? {
-        layer.styles?["dropShadow"] as? [String: Any]
+    // ---- layer styles (Photoshop-style effects) ----
+
+    /// defaults per effect key (must match composer/src/style.rs serde defaults)
+    private static let fxDefaults: [String: [String: Any]] = [
+        "dropShadow": ["enabled": true, "blend": "multiply", "dx": 8.0, "dy": 8.0,
+                       "blur": 12.0, "spread": 0.0, "color": [0.0, 0.0, 0.0, 0.5]],
+        "innerShadow": ["enabled": true, "blend": "multiply", "dx": 4.0, "dy": 4.0,
+                        "blur": 8.0, "choke": 0.0, "color": [0.0, 0.0, 0.0, 0.5]],
+        "outerGlow": ["enabled": true, "blend": "screen", "blur": 16.0, "spread": 0.0,
+                      "color": [1.0, 1.0, 0.75, 0.75]],
+        "innerGlow": ["enabled": true, "blend": "screen", "source": "edge", "blur": 8.0,
+                      "choke": 0.0, "color": [1.0, 1.0, 0.75, 0.75]],
+        "bevel": ["enabled": true, "style": "innerBevel", "direction": "up", "size": 8.0,
+                  "soften": 0.0, "angle": 120.0, "altitude": 30.0, "depth": 1.0,
+                  "highlight": ["blend": "screen", "color": [1.0, 1.0, 1.0, 0.75]],
+                  "shadow": ["blend": "multiply", "color": [0.0, 0.0, 0.0, 0.5]]],
+        "satin": ["enabled": true, "blend": "multiply", "angle": 19.0, "distance": 11.0,
+                  "size": 14.0, "invert": false, "color": [0.0, 0.0, 0.0, 0.4]],
+        "colorOverlay": ["enabled": true, "blend": "normal", "color": [1.0, 1.0, 1.0, 1.0]],
+        "gradientOverlay": ["enabled": true, "blend": "normal", "opacity": 1.0,
+                            "gradient": ["angle": 90.0, "scale": 1.0, "style": "linear",
+                                         "stops": [[0.0, 0.0, 0.0, 0.0, 1.0],
+                                                   [1.0, 1.0, 1.0, 1.0, 1.0]]]],
+        "patternOverlay": ["enabled": true, "blend": "normal", "opacity": 1.0, "scale": 1.0,
+                           "pattern": ["kind": "builtin", "name": "checker", "size": 16.0,
+                                       "fg": [0.0, 0.0, 0.0, 1.0], "bg": [1.0, 1.0, 1.0, 1.0]]],
+        "stroke": ["enabled": true, "blend": "normal", "size": 3.0, "position": "outside",
+                   "fill": ["fill": "color", "color": [0.0, 0.0, 0.0, 1.0]]],
+    ]
+
+    private func fx(_ key: String) -> [String: Any]? {
+        layer.styles?[key] as? [String: Any]
     }
 
-    private var shadowOn: Bool { shadow != nil }
+    private func fxOn(_ key: String) -> Bool { fx(key) != nil }
 
-    private func setShadow(_ changes: [String: Any]) {
+    private func setFx(_ key: String, _ changes: [String: Any]) {
         var st = layer.styles ?? [:]
-        var ds = shadow ?? ["dx": 8.0, "dy": 8.0, "blur": 12.0, "spread": 0.0,
-                            "color": [0.0, 0.0, 0.0, 0.5]] as [String: Any]
-        for (k, v) in changes { ds[k] = v }
-        st["dropShadow"] = ds
+        var e = fx(key) ?? (Self.fxDefaults[key] ?? [:])
+        for (k, v) in changes { e[k] = v }
+        st[key] = e
         doc.setLayerThrottled(layer.id, ["styles": st])
     }
 
-    private func shadowVal(_ k: String, _ def: Double) -> Double {
-        (shadow?[k] as? NSNumber)?.doubleValue ?? def
+    private func clearFx(_ key: String) {
+        var st = layer.styles ?? [:]
+        st.removeValue(forKey: key)
+        doc.setLayer(layer.id,
+                     ["styles": st.isEmpty ? NSNull() : st],
+                     then: .reloadImage)
     }
 
-    private func shadowColor(_ i: Int) -> Binding<Double> {
-        Binding(
-            get: {
-                ((shadow?["color"] as? [Any])?
-                    .compactMap { ($0 as? NSNumber)?.doubleValue }[safe: i])
-                    ?? (i == 3 ? 0.5 : 0)
-            },
-            set: { nv in
-                var c = (shadow?["color"] as? [Any])?
-                    .compactMap { ($0 as? NSNumber)?.doubleValue } ?? [0, 0, 0, 0.5]
-                while c.count < 4 { c.append(i == 3 ? 0.5 : 0) }
-                c[i] = nv
-                setShadow(["color": c])
-            })
+    private func fxVal(_ key: String, _ p: String, _ def: Double) -> Double {
+        (fx(key)?[p] as? NSNumber)?.doubleValue ?? def
+    }
+
+    private func fxNum(_ key: String, _ label: String, _ p: String, _ def: Double,
+                       _ range: ClosedRange<Double>, reset: Double? = nil) -> some View {
+        DebSliderRow(label, value: fxVal(key, p, def), range: range, reset: reset) {
+            setFx(key, [p: $0])
+        }
+    }
+
+    /// [r,g,b,a] channel of `effect.color`
+    private func fxColorVal(_ key: String, _ i: Int, _ def: Double) -> Double {
+        ((fx(key)?["color"] as? [Any])?
+            .compactMap { ($0 as? NSNumber)?.doubleValue }[safe: i]) ?? def
+    }
+
+    private func setFxColor(_ key: String, _ i: Int, _ v: Double) {
+        var c = (fx(key)?["color"] as? [Any])?
+            .compactMap { ($0 as? NSNumber)?.doubleValue } ?? [0, 0, 0, 0.5]
+        while c.count < 4 { c.append(0) }
+        c[i] = v
+        setFx(key, ["color": c])
+    }
+
+    @ViewBuilder
+    private func fxColorRows(_ key: String, _ aDef: Double) -> some View {
+        DebSliderRow("Color R", value: fxColorVal(key, 0, 0), range: 0...1) { setFxColor(key, 0, $0) }
+        DebSliderRow("Color G", value: fxColorVal(key, 1, 0), range: 0...1) { setFxColor(key, 1, $0) }
+        DebSliderRow("Color B", value: fxColorVal(key, 2, 0), range: 0...1) { setFxColor(key, 2, $0) }
+        DebSliderRow("Opacity", value: fxColorVal(key, 3, aDef), range: 0...1, reset: aDef) { setFxColor(key, 3, $0) }
+    }
+
+    /// enum string param as a segmented picker
+    private func fxEnum(_ key: String, _ p: String, _ options: [(String, String)]) -> some View {
+        SegPicker(options.map { ($0.0, $0.1) }, selection: Binding(
+            get: { (fx(key)?[p] as? String) ?? options.first?.0 ?? "" },
+            set: { setFx(key, [p: $0]) }))
+    }
+
+    // gradient params live one level deeper: gradientOverlay.gradient
+    private var gradSpec: [String: Any] {
+        (fx("gradientOverlay")?["gradient"] as? [String: Any]) ?? [:]
+    }
+
+    private func gradVal(_ p: String, _ def: Double) -> Double {
+        (gradSpec[p] as? NSNumber)?.doubleValue ?? def
+    }
+
+    private func setGrad(_ p: String, _ v: Any) {
+        var g = (fx("gradientOverlay")?["gradient"] as? [String: Any])
+            ?? ((Self.fxDefaults["gradientOverlay"]?["gradient"] as? [String: Any]) ?? [:])
+        g[p] = v
+        setFx("gradientOverlay", ["gradient": g])
+    }
+
+    // stroke fill lives one level deeper: stroke.fill.color
+    private var strokeFill: [String: Any]? { fx("stroke")?["fill"] as? [String: Any] }
+
+    private func strokeColorVal(_ i: Int) -> Double {
+        ((strokeFill?["color"] as? [Any])?
+            .compactMap { ($0 as? NSNumber)?.doubleValue }[safe: i]) ?? (i == 3 ? 1 : 0)
+    }
+
+    private func setStrokeColor(_ i: Int, _ v: Double) {
+        var f = strokeFill ?? ["fill": "color", "color": [0.0, 0.0, 0.0, 1.0]]
+        var c = (f["color"] as? [Any])?
+            .compactMap { ($0 as? NSNumber)?.doubleValue } ?? [0, 0, 0, 1]
+        while c.count < 4 { c.append(0) }
+        c[i] = v
+        f["color"] = c
+        setFx("stroke", ["fill": f])
+    }
+
+    /// one collapsible effect section: header toggle + sliders when enabled
+    private func fxSection<Content: View>(
+        _ title: String, _ key: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Kou.text2)
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { fxOn(key) },
+                    set: { on in on ? setFx(key, [:]) : clearFx(key) }))
+                    .labelsHidden().controlSize(.mini).tint(Kou.accent)
+            }
+            if fxOn(key) {
+                content()
+            }
+        }
+        .padding(.top, 2)
     }
 
     @ViewBuilder private var stylesPanel: some View {
         if layer.kind != "group" && layer.kind != "adjustment" {
-            Panel("Layer Style", trailing: {
-                Toggle("", isOn: Binding(
-                    get: { shadowOn },
-                    set: { on in
-                        if on {
-                            setShadow([:])   // defaults
-                        } else {
-                            var st = layer.styles ?? [:]
-                            st.removeValue(forKey: "dropShadow")
-                            doc.setLayer(layer.id,
-                                         ["styles": st.isEmpty ? NSNull() : st],
-                                         then: .reloadImage)
-                        }
-                    }))
-                .labelsHidden().controlSize(.mini).tint(Kou.accent)
-            }) {
-                if shadowOn {
-                    DebSliderRow("Dist X", value: shadowVal("dx", 8),
-                                 range: -200...200, reset: 8) {
-                        setShadow(["dx": $0])
-                    }
-                    DebSliderRow("Dist Y", value: shadowVal("dy", 8),
-                                 range: -200...200, reset: 8) {
-                        setShadow(["dy": $0])
-                    }
-                    DebSliderRow("Blur", value: shadowVal("blur", 12),
-                                 range: 0...200, reset: 12) {
-                        setShadow(["blur": $0])
-                    }
-                    DebSliderRow("Spread", value: shadowVal("spread", 0),
-                                 range: 0...1, reset: 0) {
-                        setShadow(["spread": $0])
-                    }
-                    DebSliderRow("Color R", value: shadowColorVal(0, 0),
-                                 range: 0...1) { shadowColor(0).wrappedValue = $0 }
-                    DebSliderRow("Color G", value: shadowColorVal(1, 0),
-                                 range: 0...1) { shadowColor(1).wrappedValue = $0 }
-                    DebSliderRow("Color B", value: shadowColorVal(2, 0),
-                                 range: 0...1) { shadowColor(2).wrappedValue = $0 }
-                    DebSliderRow("Opacity", value: shadowColorVal(3, 0.5),
-                                 range: 0...1, reset: 0.5) { shadowColor(3).wrappedValue = $0 }
-                } else {
-                    Text("Drop shadow off — toggle to enable.")
-                        .font(.system(size: 9.5)).foregroundStyle(Kou.text3)
+            Panel("Layer Style") {
+                fxSection("Drop Shadow", "dropShadow") {
+                    fxNum("dropShadow", "Dist X", "dx", 8, -200...200, reset: 8)
+                    fxNum("dropShadow", "Dist Y", "dy", 8, -200...200, reset: 8)
+                    fxNum("dropShadow", "Blur", "blur", 12, 0...200, reset: 12)
+                    fxNum("dropShadow", "Spread", "spread", 0, 0...1, reset: 0)
+                    fxColorRows("dropShadow", 0.5)
+                }
+                fxSection("Inner Shadow", "innerShadow") {
+                    fxNum("innerShadow", "Dist X", "dx", 4, -200...200, reset: 4)
+                    fxNum("innerShadow", "Dist Y", "dy", 4, -200...200, reset: 4)
+                    fxNum("innerShadow", "Blur", "blur", 8, 0...200, reset: 8)
+                    fxNum("innerShadow", "Choke", "choke", 0, 0...1, reset: 0)
+                    fxColorRows("innerShadow", 0.5)
+                }
+                fxSection("Outer Glow", "outerGlow") {
+                    fxNum("outerGlow", "Blur", "blur", 16, 0...200, reset: 16)
+                    fxNum("outerGlow", "Spread", "spread", 0, 0...1, reset: 0)
+                    fxColorRows("outerGlow", 0.75)
+                }
+                fxSection("Inner Glow", "innerGlow") {
+                    fxEnum("innerGlow", "source", [("edge", "Edge"), ("center", "Center")])
+                    fxNum("innerGlow", "Blur", "blur", 8, 0...200, reset: 8)
+                    fxNum("innerGlow", "Choke", "choke", 0, 0...1, reset: 0)
+                    fxColorRows("innerGlow", 0.75)
+                }
+                fxSection("Bevel & Emboss", "bevel") {
+                    fxEnum("bevel", "style", [("innerBevel", "Inner"), ("outerBevel", "Outer"),
+                                              ("emboss", "Emboss"), ("pillowEmboss", "Pillow"),
+                                              ("strokeEmboss", "Stroke")])
+                    fxEnum("bevel", "direction", [("up", "Up"), ("down", "Down")])
+                    fxNum("bevel", "Size", "size", 8, 0...64, reset: 8)
+                    fxNum("bevel", "Soften", "soften", 0, 0...16, reset: 0)
+                    fxNum("bevel", "Angle", "angle", 120, -180...180, reset: 120)
+                    fxNum("bevel", "Altitude", "altitude", 30, 0...90, reset: 30)
+                    fxNum("bevel", "Depth", "depth", 1, 0...4, reset: 1)
+                }
+                fxSection("Satin", "satin") {
+                    fxNum("satin", "Angle", "angle", 19, -180...180, reset: 19)
+                    fxNum("satin", "Distance", "distance", 11, 0...200, reset: 11)
+                    fxNum("satin", "Size", "size", 14, 0...200, reset: 14)
+                    fxColorRows("satin", 0.4)
+                }
+                fxSection("Color Overlay", "colorOverlay") {
+                    fxColorRows("colorOverlay", 1.0)
+                }
+                fxSection("Gradient Overlay", "gradientOverlay") {
+                    fxNum("gradientOverlay", "Opacity", "opacity", 1, 0...1, reset: 1)
+                    DebSliderRow("Angle", value: gradVal("angle", 90),
+                                 range: -180...180, reset: 90) { setGrad("angle", $0) }
+                    DebSliderRow("Scale", value: gradVal("scale", 1),
+                                 range: 0.1...4, reset: 1) { setGrad("scale", $0) }
+                }
+                fxSection("Pattern Overlay", "patternOverlay") {
+                    fxNum("patternOverlay", "Opacity", "opacity", 1, 0...1, reset: 1)
+                    fxNum("patternOverlay", "Scale", "scale", 1, 0.1...4, reset: 1)
+                }
+                fxSection("Stroke", "stroke") {
+                    fxNum("stroke", "Size", "size", 3, 0...200, reset: 3)
+                    fxEnum("stroke", "position", [("outside", "Out"), ("center", "Ctr"),
+                                                  ("inside", "In")])
+                    DebSliderRow("Color R", value: strokeColorVal(0), range: 0...1) { setStrokeColor(0, $0) }
+                    DebSliderRow("Color G", value: strokeColorVal(1), range: 0...1) { setStrokeColor(1, $0) }
+                    DebSliderRow("Color B", value: strokeColorVal(2), range: 0...1) { setStrokeColor(2, $0) }
+                    DebSliderRow("Opacity", value: strokeColorVal(3), range: 0...1, reset: 1) { setStrokeColor(3, $0) }
                 }
             }
         }
-    }
-
-    private func shadowColorVal(_ i: Int, _ def: Double) -> Double {
-        ((shadow?["color"] as? [Any])?
-            .compactMap { ($0 as? NSNumber)?.doubleValue }[safe: i]) ?? def
     }
 
     private var commonPanel: some View {

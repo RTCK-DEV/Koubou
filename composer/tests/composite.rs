@@ -260,3 +260,157 @@ fn text_renders_nonempty() {
     let lit = img.data.chunks(4).filter(|p| p[0] > 200).count();
     assert!(lit > 500, "text should have painted pixels: {lit}");
 }
+
+// ---- layer styles ----
+
+fn styled_render(styles: serde_json::Value) -> koubou_core::develop::RgbaImage {
+    let mut d = Document::new("t", 64, 48);
+    // 16×16 opaque red square at (24,16) → occupies x 24..40, y 16..32
+    let mut l = Layer::raster("sq", 16, 16, vec![255, 0, 0, 255].repeat(16 * 16));
+    l.x = 24;
+    l.y = 16;
+    l.styles = serde_json::from_value(styles).expect("styles json");
+    d.add_layer(l);
+    Composer::new(d)
+        .expect("composer")
+        .render()
+        .expect("render")
+}
+
+fn at(img: &koubou_core::develop::RgbaImage, x: u32, y: u32) -> [u8; 4] {
+    let i = ((y * img.width + x) * 4) as usize;
+    [
+        img.data[i],
+        img.data[i + 1],
+        img.data[i + 2],
+        img.data[i + 3],
+    ]
+}
+
+#[test]
+fn style_drop_shadow_offsets_silhouette() {
+    let img = styled_render(serde_json::json!({
+        "dropShadow": {"dx": 8, "dy": 8, "blur": 1, "color": [0,0,0,1]}
+    }));
+    // shifted square covers (32..48, 24..40): (44,36) is shadow-only → dark
+    let p = at(&img, 44, 36);
+    assert!(p[3] > 200 && p[0] < 40, "shadow px: {p:?}");
+    // the layer itself still red
+    let c = at(&img, 32, 24);
+    assert!(c[0] > 200 && c[1] < 40, "layer px: {c:?}");
+}
+
+#[test]
+fn style_outer_glow_paints_beyond_silhouette() {
+    let img = styled_render(serde_json::json!({
+        "outerGlow": {"blur": 4, "blend": "normal", "color": [0,1,0,1]}
+    }));
+    let p = at(&img, 21, 24); // 3px left of the square
+    assert!(p[3] > 30 && p[1] > 50, "glow px: {p:?}");
+}
+
+#[test]
+fn style_inner_shadow_darkens_inner_edge() {
+    let img = styled_render(serde_json::json!({
+        "innerShadow": {"dx": 3, "dy": 3, "blur": 1, "color": [0,0,0,1]}
+    }));
+    // top-left interior: the offset darkness field covers it
+    let p = at(&img, 25, 17);
+    assert!(p[0] < 200, "inner shadow px: {p:?}");
+    // bottom-right interior stays red
+    let c = at(&img, 38, 30);
+    assert!(c[0] > 200, "interior px: {c:?}");
+}
+
+#[test]
+fn style_inner_glow_edge_lights_rim() {
+    let img = styled_render(serde_json::json!({
+        "innerGlow": {"source": "edge", "blur": 2, "blend": "normal",
+                      "color": [0,0,1,1]}
+    }));
+    let edge = at(&img, 25, 24);
+    let center = at(&img, 32, 24);
+    assert!(
+        edge[2] > center[2] + 20,
+        "rim {edge:?} should be bluer than centre {center:?}"
+    );
+}
+
+#[test]
+fn style_bevel_light_and_shade() {
+    let img = styled_render(serde_json::json!({
+        "bevel": {"style": "innerBevel", "size": 2, "angle": 120,
+                  "altitude": 45, "depth": 1.0,
+                  "highlight": {"blend": "normal", "color": [1,1,1,1]},
+                  "shadow": {"blend": "normal", "color": [0,0,0,1]}}
+    }));
+    // angle 120 lights from the upper-left: top edge brightens…
+    let hi = at(&img, 30, 16);
+    assert!(hi[1] > 100 && hi[2] > 100, "highlight px: {hi:?}");
+    // …bottom-right edge darkens
+    let sh = at(&img, 36, 31);
+    assert!(sh[0] < 60, "shaded px: {sh:?}");
+}
+
+#[test]
+fn style_color_overlay_replaces_fill() {
+    let img = styled_render(serde_json::json!({
+        "colorOverlay": {"color": [0,1,0,1]}
+    }));
+    let p = at(&img, 32, 24);
+    assert!(p[1] > 200 && p[0] < 40, "overlay px: {p:?}");
+}
+
+#[test]
+fn style_gradient_overlay_ramps_across() {
+    let img = styled_render(serde_json::json!({
+        "gradientOverlay": {"opacity": 1, "gradient": {
+            "stops": [[0,0,0,0,1],[1,1,1,1,1]],
+            "angle": 0, "style": "linear", "scale": 1}}
+    }));
+    let l = at(&img, 26, 24);
+    let r = at(&img, 38, 24);
+    assert!(r[0] > l[0] + 60, "left {l:?} vs right {r:?}");
+}
+
+#[test]
+fn style_pattern_overlay_tiles() {
+    let img = styled_render(serde_json::json!({
+        "patternOverlay": {"opacity": 1, "pattern": {
+            "kind": "builtin", "name": "checker", "size": 4,
+            "fg": [0,0,0,1], "bg": [1,1,1,1]}}
+    }));
+    // checker cells alternate along x inside the square
+    let a = at(&img, 26, 20);
+    let b = at(&img, 30, 20);
+    assert!(
+        (a[0] as i32 - b[0] as i32).abs() > 100,
+        "checker: {a:?} {b:?}"
+    );
+}
+
+#[test]
+fn style_stroke_outside_and_inside() {
+    let img = styled_render(serde_json::json!({
+        "stroke": {"size": 3, "position": "outside",
+                   "fill": {"fill": "color", "color": [0,0,1,1]}}
+    }));
+    let p = at(&img, 22, 24); // 2px left of square
+    assert!(p[2] > 150 && p[0] < 60, "outside stroke px: {p:?}");
+
+    let img2 = styled_render(serde_json::json!({
+        "stroke": {"size": 3, "position": "inside",
+                   "fill": {"fill": "color", "color": [0,0,1,1]}}
+    }));
+    let p2 = at(&img2, 25, 24); // 1px inside left edge
+    assert!(p2[2] > 150 && p2[0] < 60, "inside stroke px: {p2:?}");
+}
+
+#[test]
+fn style_disabled_effect_renders_nothing() {
+    let img = styled_render(serde_json::json!({
+        "dropShadow": {"enabled": false, "dx": 8, "dy": 8, "color": [0,0,0,1]}
+    }));
+    let p = at(&img, 44, 36);
+    assert_eq!(p[3], 0, "disabled shadow px: {p:?}");
+}
