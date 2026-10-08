@@ -67,6 +67,9 @@ Images: pass `out` to write a PNG file; omit it for `{"pngB64","w","h"}`.
 | `doc.exportLayer` | `layer`, `out`? | PNG file or `{"pngB64"}` — the layer's own pixels |
 | `doc.maskPaint` | `layer`, `cx`, `cy`, `r`, `value`, `softness` | `"ok"` |
 | `doc.maskInvert` | `layer` | `"ok"` — toggles `mask.inverted` (creates an inverted mask if none) |
+| `doc.styleSet` | `layer`, `effect`, `params` | `"ok"` — merges params over the effect's current values (or defaults) |
+| `doc.styleClear` | `layer`, `effect`? | `"ok"` — drops one effect's params; omit `effect` to clear all |
+| `doc.styleScale` | `layer`, `scale` | `"ok"` — PS "Scale Effects": multiplies px-dimension params |
 | `doc.info` | — | w/h/layer count/duplicated-flag |
 | `doc.undo` / `doc.redo` | — | `{"changed": bool}` |
 
@@ -104,7 +107,26 @@ Sub-commands record undo history individually.
 `name`, `visible`, `opacity` 0–1, `blend` (27 modes — `normal`, `multiply`,
 `screen`, `overlay`, `softLight`, `colorDodge`, `hue`, `color`, …),
 `x`, `y`, `scale`, `mask` (null clears), `recipe` (develop/adjustment),
-`text` (text layers), `fill` (fill layers), `shapes` (shape layers).
+`text` (text layers), `fill` (fill layers), `shapes` (shape layers),
+`styles` (full LayerStyles JSON; null clears all).
+
+### Layer styles (`doc.styleSet`)
+
+`effect` is one of `dropShadow`, `innerShadow`, `outerGlow`, `innerGlow`,
+`bevel`, `satin`, `colorOverlay`, `gradientOverlay`, `patternOverlay`,
+`stroke`. `params` merges over the effect's current JSON — passing
+`{"enabled": false}` alone turns the eye off without losing settings, and
+`doc.styleSet layer … effect dropShadow params {}` creates the effect with
+PS-parity defaults. Every effect takes `enabled`, `blend` (per-effect blend
+mode) and most take `color` [r,g,b,a]. Geometry params (dx/dy/blur/size/
+distance) are in placed-layer px and follow `layer.scale` + `doc.styleScale`.
+
+```jsonl
+{"id":"doc.styleSet","layer":3,"effect":"outerGlow","params":{"blur":24,"color":[1,0.8,0.2,0.9]}}
+{"id":"doc.styleSet","layer":3,"effect":"stroke","params":{"size":4,"position":"inside","fill":{"fill":"color","color":[0,0,0,1]}}}
+{"id":"doc.styleScale","layer":3,"scale":0.5}
+{"id":"doc.styleClear","layer":3,"effect":"stroke"}
+```
 
 ## Example session
 

@@ -46,8 +46,9 @@ polish isn't:
   `doc.moveNode`, Esc exits
 - ✅ Mask UX improved: Invert chip + brush softness slider in the mask
   panel (`doc.maskInvert`, `softness` on `doc.maskPaint`)
-- 🟡 Layer styles: drop shadow only (glow/stroke/bevel missing); no
-  layered PSD export (flat only)
+- ✅ Layer styles: full PS set (shadows, glows, bevel/emboss, satin,
+  color/gradient/pattern overlays, stroke) via `doc.styleSet` + inspector;
+  no layered PSD export (flat only)
 - ❌ Smart objects, channel ops, filter gallery, liquify, text-on-path
 
 **vs the storytold craft suite** — one app now spans all seven domains:
@@ -86,11 +87,11 @@ polish isn't:
 1. **Mask UX** — mask thumbnail, gradient/brush tools, mask-from-qualifier
 2. **Layered PSD export** — a real writer that keeps layers, not the
    current flat composite
-3. **Layer styles** — glow, stroke, bevel beyond today's drop shadow
-4. **Boolean vector ops + SVG import/export**
-5. **Speed ramps** — constant rate landed (`tl.setClip rate`); ramps
+3. **Boolean vector ops + SVG import/export**
+4. **Speed ramps** — constant rate landed (`tl.setClip rate`); ramps
    = split + per-clip rate until keyframed rate exists
-6. **Real playback in Motion** — GPU realtime instead of frame stepping
+5. **Real playback in Motion** — GPU realtime instead of frame stepping
+6. **Gradient editor for layer styles** — stops UI; params only today
 7. **xtask CI** — fmt/clippy/layers/parity in one command (today:
    `scripts/parity_check.sh` + `cargo test --workspace`)
 8. **Batch ops** — scan folder → apply recipe → export, via the CLI/MCP
