@@ -65,6 +65,7 @@ Images: pass `out` to write a PNG file; omit it for `{"pngB64","w","h"}`.
 | `doc.crop` | `x`, `y`, `w`, `h` | `"ok"` — canvas + shifts layers by (-x,-y) |
 | `doc.setBackdrop` | `color` [r,g,b,a] | `"ok"` |
 | `doc.exportLayer` | `layer`, `out`? | PNG file or `{"pngB64"}` — the layer's own pixels |
+| `doc.exportPsd` | `path`, `flat`? | `{"path","layers","groups"}` — layered PSD by default; `flat:true` = merged only |
 | `doc.maskPaint` | `layer`, `cx`, `cy`, `r`, `value`, `softness` | `"ok"` |
 | `doc.maskInvert` | `layer` | `"ok"` — toggles `mask.inverted` (creates an inverted mask if none) |
 | `doc.info` | — | w/h/layer count/duplicated-flag |

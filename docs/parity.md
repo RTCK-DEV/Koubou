@@ -64,7 +64,7 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 | Document model (.koubou JSON), open/save | ✅ | `doc.new`, `doc.open`, `doc.save`, `doc.json`, `doc.fromPhoto` |
 | Full-res export + preview render | ✅ | `cmd:doc.render` (PNG/JPEG/TIFF, `format`+`quality` params), `doc.exportLayer` |
 | PSD import (layers, blend modes, masks→flattened) | ✅ | `doc.importPsd` / `koubou-cli psd` |
-| PSD export | 🟡 | `cmd:doc.exportPsd` — flattened composite, no layer preservation |
+| PSD export | ✅ | `cmd:doc.exportPsd` — layered writer: names/stack/offsets/visibility/opacity/27 blend keys, groups as section-divider+folder records, masks as user-mask channels; adjustment layers baked against the composite below, `scale` baked into pixels; `flat:true` for merged-only |
 | Canvas: pan/zoom | 🟡 | fit-to-view only |
 | Canvas: drag-move, transform handles, marquee | ✅ | `cmd:doc.pick`, `doc.bounds` + canvas gestures (alpha-precise pick, corner scale handles, marquee → selectedSet) |
 | On-canvas text editing | ✅ | double-click a text layer → in-place editor (Esc commits) |
@@ -94,10 +94,10 @@ One row per feature. Status: ✅ works · 🟡 partial/shallow · ❌ missing ·
 ## Top gaps (ordered by user impact)
 
 1. Mask UX (thumbnail, gradient tool, mask view)
-2. Layered PSD export (composite-only today)
-3. Layer styles beyond drop shadow (glow, stroke, bevel)
-4. Canvas pan/zoom (fit-to-view only)
-5. Boolean vector ops / node editing
+2. Layer styles beyond drop shadow (glow, stroke, bevel)
+3. Canvas pan/zoom (fit-to-view only)
+4. Boolean vector ops / node editing
+5. PSD round-trip depth: layer styles as native effects, clipping masks, smart objects (export today keeps pixels/metadata, not editability)
 
 ## Vector / design (vectorcraft)
 

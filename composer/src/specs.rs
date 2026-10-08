@@ -100,7 +100,7 @@ pub fn base() -> Vec<Value> {
         spec("doc.crop", "Crop the canvas; layers shift by -x,-y", json!({"x": n("px"), "y": n("px"), "w": n("px"), "h": n("px")}), &["w", "h"]),
         spec("doc.setBackdrop", "Canvas backdrop colour behind transparency", json!({"color": {"type": "array", "description": "[r,g,b,a] 0-1"}}), &["color"]),
         spec("doc.render", "Composite the open document (format: png|jpeg|tiff; pngB64 without 'out')", json!({"out": s("output path"), "format": s("png|jpeg|jpg|tiff (default png)"), "quality": n("jpeg quality 0-100, default 90"), "maxPx": n("preview size, 0=full")}), &[]),
-        spec("doc.exportPsd", "Export the merged composite as a flat PSD file", json!({"path": s("output .psd path")}), &["path"]),
+        spec("doc.exportPsd", "Export a layered PSD (names, groups, masks, blends, offsets; flat:true for merged only)", json!({"path": s("output .psd path"), "flat": {"type": "boolean", "description": "true = flattened composite only (default layered)"}}), &["path"]),
         spec("doc.pick", "Topmost layer hit at doc point (x,y) — skips adjustment layers", json!({"x": n("doc x"), "y": n("doc y")}), &["x", "y"]),
         spec("doc.bounds", "Placed bounds [x,y,w,h] of one layer, or all layers when 'layer' omitted", json!({"layer": n("layer id (optional)")}), &[]),
         spec("doc.exportLayer", "Render one layer's own pixels to PNG (or pngB64)", json!({"layer": n("layer id"), "out": s("output path")}), &["layer"]),
