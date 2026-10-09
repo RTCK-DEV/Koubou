@@ -71,7 +71,7 @@ struct KouApp: App {
             }
             CommandMenu("Help") {
                 Button("koubou Help") {
-                    NSWorkspace.shared.open(URL(string: "https://github.com/RTCK-reina/Koubou")!)
+                    NSWorkspace.shared.open(URL(string: "https://github.com/RTCK-DEV/Koubou")!)
                 }
             }
         }
